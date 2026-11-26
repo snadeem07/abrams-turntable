@@ -25,17 +25,38 @@
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); z-index: 10; max-width: calc(100vw - 32px);
     box-sizing: border-box; justify-content: center; font-size: 12px; }
   #dock label { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  #reticle { position: fixed; inset: 0; display: none; pointer-events: none; color: rgba(235, 240, 235, 0.85); z-index: 5; }
+  #reticle svg { width: 100%; height: 100%; filter: drop-shadow(0 0 1px rgba(0,0,0,0.6)); }
 </style>
 </head>
 <body>
 <canvas id="view"></canvas>
 <div id="fps">-- fps</div>
+<div id="reticle" aria-hidden="true">
+  <svg viewBox="-500 -500 1000 1000" preserveAspectRatio="xMidYMid meet">
+    <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square">
+      <path d="M-300 0 H-34 M34 0 H300 M0 34 V200"/>
+      <path d="M-34 -6 V6 M34 -6 V6"/>
+      <path d="M-120 -8 V8 M-200 -8 V8 M120 -8 V8 M200 -8 V8"/>
+      <path d="M-14 70 H14 M-10 110 H10 M-14 150 H14"/>
+      <path d="M-430 -300 v-50 h50 M430 -300 v-50 h-50 M-430 300 v50 h50 M430 300 v50 h-50"/>
+      <circle cx="0" cy="0" r="2.5" fill="currentColor"/>
+    </g>
+    <g fill="currentColor" font-family="ui-monospace, Menlo, monospace" font-size="22" letter-spacing="2">
+      <text x="-420" y="-380">TIS  WHT</text><text x="300" y="-380">NFOV 10X</text>
+      <text x="-420" y="400" id="retRange">RNG 2350</text><text x="300" y="400" id="retAz">AZ 000</text>
+    </g>
+  </svg>
+</div>
 <div id="dock">
   <label><input type="checkbox" id="optSpin" checked> Turntable</label>
   <label><input type="checkbox" id="optAPS" checked> Active protection</label>
   <label>Finish <select id="optFinish"><option value="0">Green 383</option><option value="1">NATO three-tone</option><option value="2">Desert tan</option></select></label>
   <label>Dust <input type="range" id="optDust" min="0" max="1" step="0.01" value="0.45"></label>
   <label>Wear <input type="range" id="optWear" min="0" max="1" step="0.01" value="0.35"></label>
+  <label>Light <select id="optLight"><option value="desert">Desert</option><option value="studio">Studio</option><option value="noir">Noir</option><option value="night">Night</option></select></label>
+  <label><input type="checkbox" id="optThermal"> Thermal sight</label>
+  <label><input type="checkbox" id="optSight"> Gunner's view</label>
 </div>
 
 <script type="module">
@@ -43,6 +64,11 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 
 /* =====================================================================
    core: renderer, scene, camera, controls, geometry helpers
@@ -56,7 +82,55 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;      // PCF path is patched with PCSS below
+
+/* ---------------------------------------------------------------------
+   post (part 1): PCSS patched into the shadow chunk, enabled per light.
+   A light whose shadow.radius >= 10 uses contact-hardening PCSS with
+   penumbra = (zReceiver - zBlocker) * radius * 0.001 (in shadow-map UV).
+   Any other light keeps three's stock 17-tap PCF.
+   --------------------------------------------------------------------- */
+const PCSS = { enabled: true };
+(() => {
+  const chunk = THREE.ShaderChunk.shadowmap_pars_fragment;
+  const pcss = /* glsl */`
+	#define PCSS_SAMPLES 20
+	vec2 pcssDisk[ PCSS_SAMPLES ];
+	void pcssInit( vec2 seed ) {
+		float ang = rand( seed ) * PI2;
+		for ( int i = 0; i < PCSS_SAMPLES; i ++ ) {
+			float fi = float( i ) + 0.5;
+			pcssDisk[ i ] = vec2( cos( ang ), sin( ang ) ) * sqrt( fi / float( PCSS_SAMPLES ) );
+			ang += 2.39996323;
+		}
+	}
+	float pcssShadow( sampler2D sm, vec2 size, float k, vec4 c ) {
+		pcssInit( gl_FragCoord.xy * 0.0131 + c.xy );
+		float searchR = clamp( k * 0.06, 1.5 / size.x, 0.015 );
+		float sum = 0.0, n = 0.0;
+		for ( int i = 0; i < PCSS_SAMPLES; i ++ ) {
+			float d = unpackRGBAToDepth( texture2D( sm, c.xy + pcssDisk[ i ] * searchR ) );
+			if ( d < c.z ) { sum += d; n += 1.0; }
+		}
+		if ( n < 0.5 ) return 1.0;
+		float pen = clamp( ( c.z - sum / n ) * k, 1.0 / size.x, 0.03 );
+		float lit = 0.0;
+		for ( int i = 0; i < PCSS_SAMPLES; i ++ ) lit += texture2DCompare( sm, c.xy + pcssDisk[ i ] * pen, c.z );
+		return lit / float( PCSS_SAMPLES );
+	}
+	float getShadow(`;
+  const i0 = chunk.indexOf('float getShadow(');
+  let head = chunk.slice(0, i0), body = chunk.slice(i0 + 'float getShadow('.length);
+  const pcfOpen = '#if defined( SHADOWMAP_TYPE_PCF )';
+  const j = body.indexOf(pcfOpen);
+  body = body.slice(0, j + pcfOpen.length) + '\n\t\t\tif ( shadowRadius >= 10.0 ) { shadow = pcssShadow( shadowMap, shadowMapSize, shadowRadius * 0.001, shadowCoord ); } else {' + body.slice(j + pcfOpen.length);
+  const softOpen = '#elif defined( SHADOWMAP_TYPE_PCF_SOFT )';
+  const k = body.indexOf(softOpen);
+  body = body.slice(0, k) + '}\n\t\t' + body.slice(k);
+  THREE.ShaderChunk.shadowmap_pars_fragment = head + pcss + body;
+})();
+/** Shadow radius that turns PCSS on for a directional light (light angular radius tan = tanA). */
+const pcssRadiusDir = (light, tanA) => { const c = light.shadow.camera; return 1000 * (c.far - c.near) * tanA / (c.right - c.left); };
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0xd2bb98, 140, 1350);     // colour set from the sky horizon in desert()
@@ -677,14 +751,14 @@ function terrainH(lx, lz) {
 const SKY = {
   uSunDir: { value: SUN_DIR.clone() }, uTime: { value: 0 }, uSkyI: { value: 1.0 }, uSunDisk: { value: 30.0 },
   uZenith: { value: new THREE.Color(0.07, 0.19, 0.52) }, uHorizon: { value: new THREE.Color(1.0, 0.7, 0.42) }, uMid: { value: new THREE.Color(0.78, 0.74, 0.66) },
-  uGlow: { value: new THREE.Color(1.0, 0.5, 0.22) }, uCloud: { value: 1.0 },
+  uGlow: { value: new THREE.Color(1.0, 0.5, 0.22) }, uCloud: { value: 1.0 }, uStars: { value: 0.0 },
 };
 function skyMaterial(disk = 1) {
   return new THREE.ShaderMaterial({
     uniforms: { ...SKY, uDiskMul: { value: disk } }, side: THREE.BackSide, depthWrite: false, fog: false,
     vertexShader: /* glsl */`varying vec3 vDir; void main() { vDir = position; vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0); gl_Position = p.xyww; }`,
     fragmentShader: /* glsl */`
-      uniform vec3 uSunDir, uZenith, uHorizon, uMid, uGlow; uniform float uTime, uSkyI, uSunDisk, uDiskMul, uCloud;
+      uniform vec3 uSunDir, uZenith, uHorizon, uMid, uGlow; uniform float uTime, uSkyI, uSunDisk, uDiskMul, uCloud, uStars;
       varying vec3 vDir;
       ${NOISE_GLSL}
       void main() {
@@ -701,8 +775,13 @@ function skyMaterial(disk = 1) {
           vec2 r = vec2(uv.x * 0.94 + uv.y * 0.34, -uv.x * 0.34 + uv.y * 0.94);
           float c = fbm2(r * vec2(0.9, 5.0) + fbm2(r * 0.6) * 1.5);
           c = smoothstep(0.52, 0.86, c) * smoothstep(0.02, 0.3, h) * uCloud;
-          vec3 cc = mix(vec3(1.0, 0.72, 0.52), vec3(1.0, 0.9, 0.82), t) + uGlow * pow(cs, 4.0) * 0.7;
+          vec3 cc = mix(uHorizon, uMid, t) * vec3(1.05, 1.08, 1.12) * 1.25 + uGlow * pow(cs, 4.0) * 0.7;
           col = mix(col, cc * 1.15, c * 0.6);
+        }
+        if (uStars > 0.0 && h > 0.0) {                                   // night: star field
+          vec2 sp = vec2(atan(d.z, d.x), asin(clamp(d.y, -1.0, 1.0))) * 180.0;
+          float st = hash12(floor(sp));
+          if (st > 0.996) col += vec3(1.0, 0.95, 0.88) * smoothstep(0.16, 0.0, length(fract(sp) - 0.5)) * (st - 0.996) * 220.0 * uStars * smoothstep(0.0, 0.25, h);
         }
         col += vec3(1.0, 0.86, 0.62) * smoothstep(0.99984, 0.99992, cs) * uSunDisk * uDiskMul;
         gl_FragColor = vec4(col * uSkyI, 1.0);
@@ -792,13 +871,11 @@ scene.add(ground);
 
 // --- reflection map: same sky + sunlit sand + sun disk through PMREM ---
 const pmrem = new THREE.PMREMGenerator(renderer);
-function buildDesertEnv() {
+function buildSkyEnv(groundRadiance) {
   const env = new THREE.Scene();
   const dome = new THREE.Mesh(new THREE.SphereGeometry(900, 48, 24), skyMaterial(0.25));
-  const sandAlbedo = new THREE.Color(0xd2b588);
-  const E = 4.2 * Math.max(SUN_DIR.y, 0) + 0.9;                     // sun + sky irradiance on the sand
   const gnd = new THREE.Mesh(new THREE.CircleGeometry(800, 48).rotateX(-Math.PI / 2),
-    new THREE.MeshBasicMaterial({ color: sandAlbedo.clone().multiplyScalar(E / Math.PI) }));
+    new THREE.MeshBasicMaterial({ color: groundRadiance }));
   gnd.position.y = -1.6;
   env.add(dome, gnd);
   const rt = pmrem.fromScene(env, 0.0, 0.1, 3000);
@@ -995,7 +1072,7 @@ const drift = (() => {
         float size = wisp ? 1.4 + aSeed.w * 1.2 : 0.035;
         gl_PointSize = max(size * uScale / -mv.z, 1.2);
         float edge = 1.0 - smoothstep(25.0, 35.0, max(abs(p.x), abs(p.z)));
-        vA = (wisp ? 0.05 : 0.45) * edge * uAmt * (1.0 - smoothstep(1.2, 3.0, p.y));
+        vA = (wisp ? 0.018 : 0.3) * edge * uAmt * (1.0 - smoothstep(1.2, 3.0, p.y));
         gl_Position = projectionMatrix * mv;
       }`,
     fragmentShader: PART_FRAG,
@@ -1005,6 +1082,7 @@ const drift = (() => {
   onFrame((dt, t) => { mat.uniforms.uTime.value = t; mat.uniforms.uScale.value = pxScale(); });
   return { pts, mat };
 })();
+let trackDustColor = () => {};
 const trackDust = (() => {
   const N = 260, pos = new Float32Array(N * 3), size = new Float32Array(N), alpha = new Float32Array(N);
   const vel = new Float32Array(N * 3), life = new Float32Array(N), age = new Float32Array(N).fill(1e9); let next = 0, acc = 0;
@@ -1021,6 +1099,7 @@ const trackDust = (() => {
   });
   const pts = new THREE.Points(g, mat); pts.frustumCulled = false; pts.renderOrder = 6; pts.name = 'trackDust';
   scene.add(pts);
+  trackDustColor = (r, g2, b) => mat.uniforms.uColor.value.setRGB(r, g2, b);
   function emit(x, y, z, vx, vy, vz, l) {
     const i = next; next = (next + 1) % N;
     pos.set([x, y, z], i * 3); vel.set([vx, vy, vz], i * 3); life[i] = l; age[i] = 0;
@@ -1059,17 +1138,6 @@ onFrame((dt) => {
   if (SCN.scroll !== SCN.lastScroll) { placeScenery(); SCN.lastScroll = SCN.scroll; }
 });
 
-/** Apply the desert look: sun, sky, fog, reflection map. */
-function applyDesert() {
-  sun.position.copy(SUN_DIR).multiplyScalar(60);
-  sun.color.setHex(0xffc58e); sun.intensity = 4.2;
-  hemi.intensity = 0.0;
-  const hz = SKY.uHorizon.value.clone().lerp(SKY.uMid.value, 0.3).multiplyScalar(SKY.uSkyI.value);
-  scene.fog.color.copy(hz); scene.fog.near = 60; scene.fog.far = 1250;
-  if (!SCN.desertEnv) SCN.desertEnv = buildDesertEnv();
-  scene.environment = SCN.desertEnv;
-  sky.visible = ground.visible = scenery.visible = drift.pts.visible = true;
-}
 
 /* =====================================================================
    tank root (hull, running gear, turret attach here)
@@ -2066,7 +2134,382 @@ weather(MAT.trackSteel, { mud: true, mudRad: 0, rusty: true });
 weather(MAT.trackRubber, { mud: true, mudRad: 0, bump: 1.5 });
 weather(MAT.decal, { decal: true, bump: 0.5 });
 onFrame(() => { tank.updateMatrixWorld(); W.uTankInv.value.copy(tank.matrixWorld).invert(); });
-applyDesert();
+
+/* =====================================================================
+   lighting: presets (desert / studio / noir / night)
+   ===================================================================== */
+// seamless 360 cyclorama: floor -> cove -> wall, vertex-colour falloff
+function buildCyclorama() {
+  const prof = [[0, 0], [4, 0], [8, 0], [13, 0], [18, 0], [23, 0], [27, 0], [30, 0]];
+  for (let i = 1; i <= 12; i++) { const t = i / 12 * Math.PI / 2; prof.push([30 + 8 * Math.sin(t), 8 - 8 * Math.cos(t)]); }
+  prof.push([38, 14], [38, 22], [38, 32]);
+  const g = new THREE.LatheGeometry(prof.map(([r, y]) => new THREE.Vector2(r, y)), 160);
+  const p = g.attributes.position, col = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) {
+    const r = Math.hypot(p.getX(i), p.getZ(i)), y = p.getY(i);
+    const b = y < 0.01 ? 1 - 0.32 * sstep(4, 30, r) : 0.68 - 0.4 * sstep(0, 30, y);
+    col.set([b, b, b], i * 3);
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xd8d8d4, roughness: 0.92, side: THREE.DoubleSide, name: 'cyclorama' }));
+  m.receiveShadow = true; m.name = 'cyclorama'; m.visible = false;
+  return m;
+}
+const cyc = buildCyclorama(); cyc.material.envMapIntensity = 0.4; scene.add(cyc);
+
+/** Studio reflection map: soft boxes, strip lights and an overhead ring. */
+function buildStudioEnv(noir = false) {
+  const env = new THREE.Scene();
+  const emi = (c, k) => new THREE.MeshBasicMaterial({ color: new THREE.Color(c).multiplyScalar(k), side: THREE.DoubleSide });
+  env.add(new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THREE.MeshBasicMaterial({ color: new THREE.Color(noir ? 0x050506 : 0x2a2a2c).multiplyScalar(noir ? 0.4 : 0.6), side: THREE.BackSide })));
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(40, 48).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: new THREE.Color(noir ? 0x0a0a0b : 0x8e8e8a).multiplyScalar(noir ? 0.3 : 0.55) }));
+  floor.position.y = -1.6; env.add(floor);
+  const panel = (w, h, pos, mat) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat); m.position.set(...pos); m.lookAt(0, 1.2, 0); env.add(m); };
+  if (!noir) {
+    panel(9, 6, [12, 9, 11], emi(0xfff3e4, 7));          // key soft box
+    panel(7, 4.5, [-13, 5, 8], emi(0xdbe6ff, 2.2));      // fill soft box
+    panel(1.2, 11, [-10, 6, -12], emi(0xffffff, 9));     // strip lights (rim)
+    panel(1.2, 11, [11, 6, -11], emi(0xffffff, 6));
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(7, 0.35, 12, 64).rotateX(Math.PI / 2), emi(0xffffff, 5)); ring.position.y = 13; env.add(ring);
+  } else {
+    panel(4, 3, [9, 10, 9], emi(0xffb070, 3.5));         // warm key
+    panel(1.0, 10, [-9, 5, -11], emi(0x4f7dff, 6));      // blue rim strip
+  }
+  const t = pmrem.fromScene(env, 0.0, 0.1, 200).texture;
+  env.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+  return t;
+}
+
+// extra lights
+const lightTarget = new THREE.Object3D(); lightTarget.position.set(0, 1.0, 0.2); scene.add(lightTarget);
+sun.target = lightTarget;
+const fillLight = new THREE.DirectionalLight(0xbfd2ff, 0.9); fillLight.position.set(-10, 5, 7); fillLight.target = lightTarget;
+const rimLight = new THREE.SpotLight(0xffffff, 900, 0, 0.5, 0.7, 2); rimLight.position.set(-5, 9, -13); rimLight.target = lightTarget;
+const noirKey = new THREE.SpotLight(0xffaa66, 700, 0, 0.44, 0.55, 2); noirKey.position.set(7, 10.5, 8); noirKey.target = lightTarget;
+noirKey.castShadow = true; noirKey.shadow.mapSize.set(2048, 2048); noirKey.shadow.camera.near = 6; noirKey.shadow.camera.far = 40;
+noirKey.shadow.bias = -0.0004; noirKey.shadow.normalBias = 0.03;
+const noirRimTarget = new THREE.Object3D(); noirRimTarget.position.set(0.5, 1.9, 0.5); scene.add(noirRimTarget);
+const noirRim = new THREE.SpotLight(0x4f7dff, 2600, 19, 0.34, 0.55, 2); noirRim.position.set(-5, 7.5, -11); noirRim.target = noirRimTarget;   // range-limited so it grazes, not floods
+// headlights (night)
+const headlights = [1, -1].map(sx => {
+  const l = new THREE.SpotLight(0xffe3b8, 650, 80, 0.42, 0.55, 2);
+  l.position.set(sx * 1.33, 1.18, 3.72);
+  const t = new THREE.Object3D(); t.position.set(sx * 1.9, 0.0, 22); l.target = t;
+  tank.add(l, t);
+  return l;
+});
+// faint light beams for the headlights
+const beamMat = new THREE.ShaderMaterial({
+  uniforms: { uI: { value: 0.07 } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  vertexShader: `varying float vT; varying vec3 vN; varying vec3 vV; void main(){ vT = -position.y / 16.0 + 0.5; vec4 mv = modelViewMatrix * vec4(position,1.0); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }`,
+  fragmentShader: `uniform float uI; varying float vT; varying vec3 vN; varying vec3 vV; void main(){ float e = pow(abs(dot(vN, vV)), 1.5); float a = uI * e * pow(1.0 - vT, 1.6) * smoothstep(0.0, 0.05, vT); gl_FragColor = vec4(vec3(1.0, 0.9, 0.72) * a, 1.0);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }`,
+});
+const beams = [1, -1].map(sx => {
+  const g = new THREE.ConeGeometry(3.4, 16, 32, 1, true); g.rotateX(-Math.PI / 2); g.translate(0, 0, 8);
+  const m = new THREE.Mesh(g, beamMat); m.position.set(sx * 1.33, 1.18, 3.75); m.lookAt(sx * 1.9, 0.0, 22); m.renderOrder = 8; m.visible = false; m.name = 'beam';
+  tank.add(m); return m;
+});
+scene.add(fillLight, rimLight, noirKey, noirRim);
+
+const DESERT_SKY = { zen: SKY.uZenith.value.clone(), hor: SKY.uHorizon.value.clone(), mid: SKY.uMid.value.clone(), glow: SKY.uGlow.value.clone() };
+const MOON_DIR = new THREE.Vector3(-0.45, 0.62, 0.5).normalize();
+const ENV = {};
+const LIGHTING = { preset: 'desert' };
+function setSky(night) {
+  if (!night) {
+    SKY.uZenith.value.copy(DESERT_SKY.zen); SKY.uHorizon.value.copy(DESERT_SKY.hor); SKY.uMid.value.copy(DESERT_SKY.mid); SKY.uGlow.value.copy(DESERT_SKY.glow);
+    SKY.uSunDir.value.copy(SUN_DIR); SKY.uSunDisk.value = 30; SKY.uStars.value = 0; SKY.uCloud.value = 1;
+  } else {
+    SKY.uZenith.value.setRGB(0.004, 0.008, 0.022); SKY.uHorizon.value.setRGB(0.025, 0.03, 0.05); SKY.uMid.value.setRGB(0.012, 0.018, 0.036);
+    SKY.uGlow.value.setRGB(0.05, 0.07, 0.11); SKY.uSunDir.value.copy(MOON_DIR); SKY.uSunDisk.value = 3.0; SKY.uStars.value = 1; SKY.uCloud.value = 0.25;
+  }
+}
+/** Switch lighting preset. */
+function applyPreset(name) {
+  LIGHTING.preset = name;
+  const desertLike = name === 'desert' || name === 'night', studioLike = name === 'studio' || name === 'noir';
+  sky.visible = ground.visible = scenery.visible = drift.pts.visible = desertLike;
+  cyc.visible = studioLike;
+  for (const l of [fillLight, rimLight, noirKey, noirRim]) l.visible = false;
+  headlights.forEach(l => l.visible = false); beams.forEach(b => b.visible = false);
+  MAT.headlamp.emissive.setHex(0x000000); MAT.lensRed.emissive.setHex(0x2a0302); MAT.lensRed.emissiveIntensity = 1;
+  hemi.intensity = 0; sun.visible = true; renderer.toneMappingExposure = 1.0;
+  scene.background = null;
+  if (name === 'desert') {
+    setSky(false);
+    sun.position.copy(SUN_DIR).multiplyScalar(60); sun.color.setHex(0xffc58e); sun.intensity = 4.2;
+    sun.shadow.radius = PCSS.enabled ? pcssRadiusDir(sun, 0.035) : 2;
+    scene.fog.color.copy(SKY.uHorizon.value.clone().lerp(SKY.uMid.value, 0.3).multiplyScalar(SKY.uSkyI.value)); scene.fog.near = 60; scene.fog.far = 1250;
+    ENV.desert ??= buildSkyEnv(new THREE.Color(0xd2b588).multiplyScalar((4.2 * Math.max(SUN_DIR.y, 0) + 0.9) / Math.PI));
+    scene.environment = ENV.desert;
+    drift.mat.uniforms.uColor.value.setRGB(0.62, 0.48, 0.34); trackDustColor(0.6, 0.48, 0.35);
+  } else if (name === 'night') {
+    setSky(true);
+    sun.position.copy(MOON_DIR).multiplyScalar(60); sun.color.setHex(0x9fb6e8); sun.intensity = 0.6;
+    sun.shadow.radius = PCSS.enabled ? pcssRadiusDir(sun, 0.02) : 2;
+    scene.fog.color.setRGB(0.018, 0.024, 0.042); scene.fog.near = 30; scene.fog.far = 700;
+    ENV.night ??= buildSkyEnv(new THREE.Color(0xd2b588).multiplyScalar(0.012));
+    scene.environment = ENV.night;
+    headlights.forEach(l => l.visible = true); beams.forEach(b => b.visible = true);
+    MAT.headlamp.emissive.setHex(0xfff0d8); MAT.headlamp.emissiveIntensity = 6;
+    MAT.lensRed.emissive.setHex(0xff2010); MAT.lensRed.emissiveIntensity = 3;
+    renderer.toneMappingExposure = 1.5;
+    drift.mat.uniforms.uColor.value.setRGB(0.05, 0.06, 0.08); trackDustColor(0.12, 0.11, 0.1);
+  } else if (name === 'studio') {
+    sun.position.set(9, 13, 10).normalize().multiplyScalar(60); sun.color.setHex(0xfff4e6); sun.intensity = 4.6;
+    sun.shadow.radius = PCSS.enabled ? pcssRadiusDir(sun, 0.06) : 3;
+    fillLight.visible = rimLight.visible = true;
+    cyc.material.color.setHex(0xd8d8d4);
+    scene.fog.near = 1e5; scene.fog.far = 2e5; scene.background = new THREE.Color(0x777775);
+    ENV.studio ??= buildStudioEnv(false); scene.environment = ENV.studio;
+    trackDustColor(0.7, 0.66, 0.6);
+  } else if (name === 'noir') {
+    sun.visible = false;
+    noirKey.visible = noirRim.visible = true;
+    noirKey.shadow.radius = PCSS.enabled ? 40 : 2;
+    cyc.material.color.setHex(0x1b1b1e);
+    scene.fog.near = 1e5; scene.fog.far = 2e5; scene.background = new THREE.Color(0x050506);
+    ENV.noir ??= buildStudioEnv(true); scene.environment = ENV.noir;
+    renderer.toneMappingExposure = 1.1;
+    trackDustColor(0.3, 0.28, 0.26);
+  }
+  if (POST.final) POST.final.uniforms.uVig.value = name === 'noir' ? 0.55 : name === 'night' ? 0.5 : 0.32;
+}
+
+/* =====================================================================
+   post: composer (render -> GTAO -> output/tonemap -> vignette+grain),
+   contact shade, white-hot thermal sight
+   ===================================================================== */
+const POST = {};
+// computed contact shade: SDF of the hull footprint + tight dark track contact strips
+const contactShade = (() => {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(7, 11).rotateX(-Math.PI / 2), new THREE.ShaderMaterial({
+    uniforms: { uStrength: { value: 1.0 } }, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4,
+    vertexShader: `varying vec2 vP; void main(){ vP = position.xz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: `uniform float uStrength; varying vec2 vP;
+      float sdBox(vec2 p, vec2 b) { vec2 d = abs(p) - b; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
+      void main() {
+        float hullD = sdBox(vP - vec2(0.0, 0.0), vec2(1.55, 3.6));
+        float trk = min(sdBox(vP - vec2(1.455, -0.05), vec2(0.28, 2.45)), sdBox(vP + vec2(1.455, 0.05), vec2(0.28, 2.45)));
+        float a = (1.0 - smoothstep(-0.9, 1.3, hullD)) * 0.42 + (1.0 - smoothstep(-0.05, 0.4, trk)) * 0.4;
+        gl_FragColor = vec4(0.0, 0.0, 0.0, clamp(a, 0.0, 0.85) * uStrength);
+      }`,
+  }));
+  m.position.y = 0.004; m.renderOrder = 1; m.name = 'contactShade';
+  scene.add(m); return m;
+})();
+// GTAO normal pass that honours terrain displacement
+const aoNormalMat = new THREE.ShaderMaterial({
+  uniforms: { uTerrain: { value: 0 }, uScroll: SAND.uScroll }, blending: THREE.NoBlending,
+  vertexShader: `#include <common>
+    ${NOISE_GLSL}
+    ${TERRAIN_GLSL}
+    uniform float uTerrain; varying vec3 vN;
+    void main() {
+      #include <beginnormal_vertex>
+      #include <begin_vertex>
+      if (uTerrain > 0.5) {
+        float tH = terrainH(position.xz), tHx = terrainH(position.xz + vec2(0.5, 0.0)), tHz = terrainH(position.xz + vec2(0.0, 0.5));
+        objectNormal = normalize(vec3(tH - tHx, 0.5, tH - tHz)); transformed = vec3(position.x, tH, position.z);
+      }
+      #include <defaultnormal_vertex>
+      #include <project_vertex>
+      vN = normalize(transformedNormal);
+    }`,
+  fragmentShader: `#include <packing>
+    varying vec3 vN; void main() { gl_FragColor = vec4(packNormalToRGB(normalize(vN) * (gl_FrontFacing ? 1.0 : -1.0)), 1.0); }`,
+});
+ground.onBeforeRender = (r, sc, cam, geo, mat) => { if (mat === aoNormalMat) { mat.uniforms.uTerrain.value = 1; mat.uniformsNeedUpdate = true; } };
+ground.onAfterRender = (r, sc, cam, geo, mat) => { if (mat === aoNormalMat) { mat.uniforms.uTerrain.value = 0; mat.uniformsNeedUpdate = true; } };
+
+const FinalShader = {
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uVig: { value: 0.32 }, uGrain: { value: 0.03 }, uThermal: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse; uniform float uTime, uVig, uGrain, uThermal; uniform vec2 uRes; varying vec2 vUv;
+    float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+    void main() {
+      vec3 c = texture2D(tDiffuse, vUv).rgb;
+      if (uThermal > 0.5) {
+        vec2 px = 1.0 / uRes;
+        float b = (texture2D(tDiffuse, vUv + vec2(px.x, 0.0)).r + texture2D(tDiffuse, vUv - vec2(px.x, 0.0)).r +
+                   texture2D(tDiffuse, vUv + vec2(0.0, px.y)).r + texture2D(tDiffuse, vUv - vec2(0.0, px.y)).r) * 0.25;
+        float h = pow(mix(c.r, b, 0.45), 2.2);                                          // undo sRGB encode -> heat
+        h = smoothstep(0.12, 0.85, h);                                                  // AGC
+        h += (h12(floor(vUv * uRes) + floor(fract(uTime * 7.13) * 97.0)) - 0.5) * 0.07;  // sensor noise
+        h += (h12(vec2(floor(vUv.x * uRes.x), 3.0)) - 0.5) * 0.025;                       // column fixed pattern
+        c = vec3(clamp(h, 0.0, 1.0));
+      }
+      vec2 q = vUv - 0.5; q.x *= uRes.x / uRes.y;
+      c *= 1.0 - smoothstep(0.42, 1.2, length(q)) * (uThermal > 0.5 ? 0.9 : uVig);
+      float g = h12(gl_FragCoord.xy + floor(fract(uTime * 3.7) * 1000.0)) - 0.5;
+      c += g * uGrain * (0.55 + 0.45 * (1.0 - dot(c, vec3(0.333))));
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+};
+(() => {
+  const composer = new EffectComposer(renderer);
+  composer.setPixelRatio(renderer.getPixelRatio());
+  composer.setSize(window.innerWidth, window.innerHeight);
+  const renderPass = new RenderPass(scene, camera);
+  const gtao = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
+  gtao.normalMaterial = aoNormalMat;
+  gtao.updateGtaoMaterial({ radius: 0.7, distanceExponent: 1.5, thickness: 1.5, scale: 1.0, samples: 16, distanceFallOff: 1.0, screenSpaceRadius: false });
+  gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, radiusExponent: 1, rings: 2, samples: 16 });
+  gtao.blendIntensity = 0.85;
+  const output = new OutputPass();
+  const final = new ShaderPass(FinalShader);
+  composer.addPass(renderPass); composer.addPass(gtao); composer.addPass(output); composer.addPass(final);
+  Object.assign(POST, { composer, renderPass, gtao, output, final, camera });
+  POST.setCamera = (cam) => { POST.camera = cam; renderPass.camera = cam; gtao.camera = cam; };
+  POST.resize = (w, h) => { composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w, h); final.uniforms.uRes.value.set(w * renderer.getPixelRatio(), h * renderer.getPixelRatio()); };
+  POST.resize(window.innerWidth, window.innerHeight);
+  POST.render = (dt, t) => { final.uniforms.uTime.value = t; composer.render(dt); };
+})();
+
+// --- thermal: white-hot heat materials swapped in per mesh -------------
+const THERM = { on: false, saved: new Map(), cache: new Map(), uMove: { value: 0 }, uBarrel: { value: 0 } };
+const HEAT_VERT = /* glsl */`
+  #include <common>
+  uniform mat4 uTankInv; varying vec3 vTP; varying vec3 vTN; varying vec3 vVN; varying vec3 vObj; varying float vDist; varying vec2 vUv2;
+  void main() {
+    #include <beginnormal_vertex>
+    #include <defaultnormal_vertex>
+    #include <begin_vertex>
+    #include <project_vertex>
+    vec4 tp = vec4(transformed, 1.0); vec3 tn = objectNormal;
+    #ifdef USE_INSTANCING
+      tp = instanceMatrix * tp; tn = mat3(instanceMatrix) * tn;
+    #endif
+    mat4 toT = uTankInv * modelMatrix;
+    vTP = (toT * tp).xyz; vTN = normalize(mat3(toT) * tn); vVN = normalize(transformedNormal); vObj = transformed; vDist = -mvPosition.z;
+    #if ALPHA > 0
+      vUv2 = uv;
+    #endif
+  }`;
+const HEAT_FRAG = /* glsl */`
+  uniform float uBase, uMove, uBarrel, uFric; uniform sampler2D uAlphaTex;
+  varying vec3 vTP; varying vec3 vTN; varying vec3 vVN; varying vec3 vObj; varying float vDist; varying vec2 vUv2;
+  void main() {
+    #if ALPHA == 1
+      if (texture2D(uAlphaTex, vUv2).g < 0.5) discard;
+    #elif ALPHA == 2
+      if (texture2D(uAlphaTex, vUv2).a < 0.5) discard;
+    #endif
+    float h = uBase;
+    #if TANK
+      h += 0.42 * (1.0 - smoothstep(0.4, 2.4, length((vTP - vec3(0.0, 1.15, -3.3)) * vec3(0.75, 1.0, 0.9))));   // engine bay
+      h += 0.5 * (1.0 - smoothstep(0.1, 0.95, length((vTP - vec3(0.0, 1.07, -4.0)) * vec3(0.6, 1.2, 1.0))));     // exhaust
+      h += 0.06 * smoothstep(0.4, 0.95, vTN.y);                                                                   // sun-soaked tops
+    #endif
+    h += uFric * (0.14 + 0.35 * uMove);
+    #if BARREL
+      h += uBarrel * 0.6 * smoothstep(0.3, 1.5, vObj.z);
+    #endif
+    h *= mix(0.8, 1.0, abs(vVN.z));
+    h = mix(h, 0.2, smoothstep(60.0, 1300.0, vDist));
+    gl_FragColor = vec4(vec3(clamp(h, 0.0, 1.0)), 1.0);
+  }`;
+function heatMat(base, o = {}) {
+  const key = [base, o.tank ? 1 : 0, o.fric || 0, o.barrel ? 1 : 0, o.alphaTex ? o.alphaTex.uuid : '', o.alpha || 0, o.side ?? 0].join('|');
+  if (THERM.cache.has(key)) return THERM.cache.get(key);
+  const m = new THREE.ShaderMaterial({
+    uniforms: { uBase: { value: base }, uFric: { value: o.fric || 0 }, uTankInv: W.uTankInv, uMove: THERM.uMove, uBarrel: THERM.uBarrel, uAlphaTex: { value: o.alphaTex || null } },
+    defines: { TANK: o.tank ? 1 : 0, BARREL: o.barrel ? 1 : 0, ALPHA: o.alpha || 0 },
+    vertexShader: HEAT_VERT, fragmentShader: HEAT_FRAG, side: o.side ?? THREE.FrontSide,
+  });
+  THERM.cache.set(key, m); return m;
+}
+const heatSky = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  vertexShader: `varying vec3 vDir; void main() { vDir = position; vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0); gl_Position = p.xyww; }`,
+  fragmentShader: `varying vec3 vDir; void main() { float h = normalize(vDir).y; gl_FragColor = vec4(vec3(mix(0.2, 0.04, pow(clamp(h, 0.0, 1.0), 0.45))), 1.0); }`,
+});
+const heatGround = new THREE.ShaderMaterial({
+  uniforms: { uScroll: SAND.uScroll, uSun: { value: SUN_DIR } },
+  vertexShader: `${NOISE_GLSL}\n${TERRAIN_GLSL}
+    varying vec3 vW; varying vec3 vN; varying vec2 vL; varying float vD;
+    void main() { vec2 l = position.xz; float h = terrainH(l), hx = terrainH(l + vec2(0.5, 0.0)), hz = terrainH(l + vec2(0.0, 0.5));
+      vN = normalize(vec3(h - hx, 0.5, h - hz)); vW = vec3(l.x, h, l.y + uScroll); vL = l;
+      vec4 mv = modelViewMatrix * vec4(l.x, h, l.y, 1.0); vD = -mv.z; gl_Position = projectionMatrix * mv; }`,
+  fragmentShader: `${NOISE_GLSL}
+    uniform vec3 uSun; varying vec3 vW; varying vec3 vN; varying vec2 vL; varying float vD;
+    void main() {
+      vec2 pw = vW.xz;
+      float h = 0.25 + 0.18 * max(dot(vN, uSun), 0.0) + 0.09 * (fbm2(pw * 0.05) - 0.5) + 0.05 * (fbm2(pw * 0.6) - 0.5);
+      h += 0.018 * sin(dot(pw, vec2(0.94, 0.34)) * 41.0 + fbm2(pw * 0.35) * 14.0) * (1.0 - smoothstep(8.0, 40.0, vD));
+      float band = (1.0 - smoothstep(0.27, 0.34, abs(abs(vL.x) - 1.455))) * smoothstep(-3.2, -3.7, vL.y) * (1.0 - smoothstep(10.0, 60.0, -vL.y));
+      h += band * 0.06;
+      h = mix(h, 0.2, smoothstep(60.0, 1300.0, vD));
+      gl_FragColor = vec4(vec3(h), 1.0);
+    }`,
+});
+const TANK_HEAT = { paint: 0.42, mesh: 0.4, steel: 0.4, darkSteel: 0.41, black: 0.42, rubber: 0.44, glass: 0.2, headlamp: 0.25, lensRed: 0.3, lensAmber: 0.25,
+  canvas: 0.38, canvasTan: 0.38, strap: 0.38, cardboard: 0.36, cooler: 0.3, waterCan: 0.32, camNet: 0.37, radome: 0.46, decal: 0.4,
+  rgPaint: 0.46, rgRubber: 0.47, rgSteel: 0.47, rgDark: 0.47, trackSteel: 0.46, trackRubber: 0.47 };
+const SCENE_HEAT = { mesa: 0.3, rock: 0.4, twig: 0.3, leaf: 0.26, concrete: 0.38, geotextile: 0.36, wire: 0.4, sandbag: 0.36, drumOlive: 0.44, drumBlue: 0.44, drumRust: 0.46, black: 0.42, cyclorama: 0.28 };
+function isUnder(o, root) { for (let p = o; p; p = p.parent) if (p === root) return true; return false; }
+function setThermal(on) {
+  if (on === THERM.on) return;
+  THERM.on = on;
+  if (on) {
+    scene.traverse(o => {
+      if (o.isPoints || o === contactShade || o.name === 'beam') { THERM.saved.set(o, { visible: o.visible }); o.visible = false; return; }
+      if (!o.isMesh) return;
+      const m = o.material; let hm;
+      if (o === ground) hm = heatGround;
+      else if (o === sky) hm = heatSky;
+      else if (isUnder(o, tank)) {
+        const n = m.name, nightLamp = LIGHTING.preset === 'night' && n === 'headlamp';
+        const fric = /^(rg|track)/.test(n) ? 1 : 0;
+        hm = heatMat(nightLamp ? 0.9 : (TANK_HEAT[n] ?? 0.4), { tank: true, fric, barrel: isUnder(o, PARTS.gun),
+          alpha: m.alphaMap ? 1 : (m.map && m.alphaTest > 0 ? 2 : 0), alphaTex: m.alphaMap || (m.alphaTest > 0 ? m.map : null), side: m.side });
+      } else hm = heatMat(SCENE_HEAT[m.name] ?? 0.35, { alpha: m.alphaMap ? 1 : 0, alphaTex: m.alphaMap, side: m.side });
+      THERM.saved.set(o, { material: m }); o.material = hm;
+    });
+    POST.gtao.enabled = false; renderer.toneMapping = THREE.NoToneMapping;
+    POST.final.uniforms.uThermal.value = 1; POST.final.uniforms.uGrain.value = 0.02;
+  } else {
+    for (const [o, st] of THERM.saved) { if ('material' in st) o.material = st.material; if ('visible' in st) o.visible = st.visible; }
+    THERM.saved.clear();
+    POST.gtao.enabled = true; renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    POST.final.uniforms.uThermal.value = 0; POST.final.uniforms.uGrain.value = 0.03;
+  }
+}
+onFrame((dt) => {
+  THERM.uMove.value += ((Math.min(1, Math.abs(RG.speed || 0) / 8)) - THERM.uMove.value) * Math.min(1, dt * 0.3);
+  THERM.uBarrel.value *= Math.exp(-dt / 40);
+});
+
+// --- gunner's sight camera (narrow FOV, follows turret + gun elevation) ---
+const sightCam = new THREE.PerspectiveCamera(9, window.innerWidth / window.innerHeight, 0.5, 4000);
+sightCam.position.set(-0.95, TUR.roof + 0.19, 1.36);
+PARTS.turret.add(sightCam);
+const SIGHT = { on: false };
+function setSight(on) {
+  SIGHT.on = on;
+  POST.setCamera(on ? sightCam : camera);
+  controls.enabled = !on;
+  document.getElementById('reticle').style.display = on ? 'block' : 'none';
+}
+const _rd = new THREE.Vector3(), _ro = new THREE.Vector3();
+let sightTick = 0;
+onFrame(() => {
+  sightCam.rotation.set(-PARTS.gun.rotation.x, Math.PI, 0, 'YXZ');
+  if (!SIGHT.on || (sightTick++ % 8)) return;
+  // azimuth from turret yaw; laser range by marching the sight ray against the terrain height function
+  const az = ((-PARTS.turret.rotation.y * 180 / Math.PI) % 360 + 360) % 360;
+  document.getElementById('retAz').textContent = 'AZ ' + String(Math.round(az)).padStart(3, '0');
+  sightCam.getWorldPosition(_ro); sightCam.getWorldDirection(_rd);
+  let d = 0, hit = 0;
+  for (let i = 0; i < 160 && !hit; i++) { d += 2 + d * 0.03; const y = _ro.y + _rd.y * d; if (y < terrainH(_ro.x + _rd.x * d, _ro.z + _rd.z * d)) hit = d; }
+  document.getElementById('retRange').textContent = 'RNG ' + (hit ? String(Math.round(hit / 5) * 5).padStart(4, '0') : '----');
+});
+
+applyPreset('desert');
 
 /* =====================================================================
    ui (minimal for now)
@@ -2076,6 +2519,12 @@ document.getElementById('optAPS').addEventListener('change', e => { PARTS.aps.vi
 document.getElementById('optFinish').addEventListener('change', e => { W.uScheme.value = +e.target.value; });
 document.getElementById('optDust').addEventListener('input', e => { W.uDust.value = +e.target.value; });
 document.getElementById('optWear').addEventListener('input', e => { W.uWear.value = +e.target.value; });
+document.getElementById('optLight').addEventListener('change', e => { const th = THERM.on; if (th) setThermal(false); applyPreset(e.target.value); if (th) setThermal(true); });
+document.getElementById('optThermal').addEventListener('change', e => {
+  setThermal(e.target.checked);
+  if (e.target.checked && !SIGHT.on) { document.getElementById('optSight').checked = true; setSight(true); }
+});
+document.getElementById('optSight').addEventListener('change', e => setSight(e.target.checked));
 
 /* =====================================================================
    perf: FPS readout, resize
@@ -2089,7 +2538,9 @@ onFrame(() => {
 function onResize() {
   const w = window.innerWidth, h = window.innerHeight;
   camera.aspect = w / h; camera.updateProjectionMatrix();
+  sightCam.aspect = w / h; sightCam.updateProjectionMatrix();
   renderer.setSize(w, h, false);
+  POST.resize(w, h);
 }
 window.addEventListener('resize', onResize);
 
@@ -2100,11 +2551,11 @@ function frame() {
   const dt = Math.min(clock.getDelta(), 0.1), t = clock.elapsedTime;
   for (const fn of updaters) fn(dt, t);
   controls.update(dt);
-  renderer.render(scene, camera);
+  POST.render(dt, t);
 }
 renderer.setAnimationLoop(frame);
 
-window.APP = { SCN, SKY, W, RG, THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
+window.APP = { POST, THERM, setThermal, setSight, applyPreset, LIGHTING, SCN, SKY, W, RG, THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
 </script>
 </body>
 </html>

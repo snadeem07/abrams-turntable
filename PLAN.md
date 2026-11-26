@@ -22,7 +22,7 @@ Shared helpers (beveled extrusions, lofts, bolt and strap generators, merge-and-
 - **CHECKPOINT:** switch to Fable 5.2 at max effort (or Opus 5.5 at max effort).
 - [x] **M6 – Materials and weathering.** Triplanar weathering injected with onBeforeCompile; Green 383, NATO three-tone and desert tan finishes; dust and wear sliders; stencil decals.
 - [x] **M7 – Desert scene.** Vertex-displaced dunes, wind ripples, sky dome with cirrus, mesas, rocks, shrubs, outpost, tread marks, scenery that wraps while driving, PMREM environment, drifting sand and track dust.
-- [ ] **M8 – Lighting presets and post-processing.** Studio cyclorama, Noir and Night presets; PCSS soft shadows; GTAO; contact shade; vignette and grain; white-hot thermal mode with reticle.
+- [x] **M8 – Lighting presets and post-processing.** Studio cyclorama, Noir and Night presets; PCSS soft shadows; GTAO; contact shade; vignette and grain; white-hot thermal mode with reticle.
 - **CHECKPOINT:** switch to Sonnet 5.5 at high effort.
 - [ ] **M9 – Interaction.** Driving, turret traverse, gun elevation, firing effects, hatches.
 - [ ] **M10 – Audio.** Procedural turbine, servos, cannon, wind and music, each toggleable.
@@ -61,3 +61,6 @@ Shared helpers (beveled extrusions, lofts, bolt and strap generators, merge-and-
 ## Notes and limitations
 - The three.js CDN may be blocked in the build container. In that case three@0.160 is installed with npm for local testing only, and the shipped importmap still points to the CDN.
 - Browser checks run in headless Chromium with SwiftShader (CPU rendering), so frame rates measured there (around 1 fps for the full scene) are not representative of a GPU. Use them only to compare one build against another. After M7 the scene is about 860k triangles (the track and wheels about 310k, the scenery about 300k). The shrubs and rocks were reduced from 2.6M triangles, and the shrubs do not cast shadows.
+- PCSS is turned on per light through `shadow.radius >= 10` (softness = radius × 0.001; `pcssRadiusDir()` works it out for directional lights). Directional lights get correct contact-hardening shadows. On the noir spotlight it is an approximation, because spotlight shadow-map depth is non-linear.
+- GTAO uses a custom normal material that applies the same terrain displacement, so the occlusion pass sees the real dunes. Alpha-tested wire mesh shows up as solid panels in the AO pass only.
+- The thermal sight swaps in heat materials for each mesh (hot engine and exhaust, warm running gear, cold sky). The gunner's view uses a 9° camera at the gunner's sight that follows turret traverse and gun elevation. Its range readout comes from ray-marching the terrain height function.
