@@ -14,7 +14,7 @@ Shared helpers (beveled extrusions, lofts, bolt and strap generators, merge-and-
 ## Milestones
 
 - [x] **M0 – Plan.** This file.
-- [ ] **M1 – Core setup.** Renderer, camera, orbit controls with turntable auto-rotate, ACES tone mapping, basic sun, ground plane, FPS readout.
+- [x] **M1 – Core setup.** Renderer, camera, orbit controls with turntable auto-rotate, ACES tone mapping, basic sun, ground plane, FPS readout.
 - [ ] **M2 – Hull.** Beveled hull with sloped glacis; driver's hatch and periscopes; headlight clusters with guards; tow eyes and shackles; fuel caps; engine deck grilles; rear exhaust grille; tail lights; mud flaps. Side skirts made of framed panels with raised lips, lifting handles and a rubber bottom strip.
 - [ ] **M3 – Running gear.** Seven road wheels per side with hub detail, front idler, rear sprocket, return rollers. Instanced track links with split rubber pads, end connectors and wedge bolts, laid on a path that wraps around the wheels and can animate.
 - [ ] **M4 – Turret and gun.** Lofted turret, hex bolts, lifting eyes, smoke grenade launchers, side stowage boxes. Bustle rack with bedrolls, ration boxes, a cooler, cam nets, water cans and straps. Commander's remote weapon station, independent thermal viewer that scans by itself, loader's MG on a skate mount, two whip antennas, crosswind sensor. 120 mm gun with thermal sleeve, latches and straps, bore evacuator, muzzle reference sensor, and a canvas mantlet cover.

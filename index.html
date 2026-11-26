@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>M1A2 SEPv3 Turntable</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  :root { --ink: #e9e4d4; --glass: rgba(22, 24, 20, 0.55); --line: rgba(233, 228, 212, 0.18); }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1a17; color: var(--ink);
+    font-family: "Helvetica Neue", Arial, sans-serif; }
+  canvas#view { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #fps { position: fixed; top: 8px; right: 10px; font: 11px/1.2 ui-monospace, Menlo, monospace;
+    padding: 4px 7px; border-radius: 6px; background: var(--glass); border: 1px solid var(--line);
+    pointer-events: none; z-index: 10; }
+  #dock { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: flex; flex-wrap: wrap;
+    gap: 8px; padding: 8px 10px; border-radius: 12px; background: var(--glass); border: 1px solid var(--line);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); z-index: 10; max-width: calc(100vw - 32px);
+    box-sizing: border-box; justify-content: center; font-size: 12px; }
+  #dock label { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="fps">-- fps</div>
+<div id="dock">
+  <label><input type="checkbox" id="optSpin" checked> Turntable</label>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* =====================================================================
+   core: renderer, scene, camera, controls, geometry helpers
+   Units: metres. Tank forward = +Z, up = +Y, tank's right = -X.
+   ===================================================================== */
+const canvas = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xc9b79a);
+scene.fog = new THREE.Fog(0xd2bb98, 60, 260);
+
+const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.1, 2000);
+camera.position.set(10.5, 3.6, 11.5);
+
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 1.25, 0.4);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.55;
+controls.minDistance = 5;
+controls.maxDistance = 32;
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.update();
+
+const clock = new THREE.Clock();
+const updaters = [];            // per-frame callbacks: fn(dt, t)
+const onFrame = (fn) => updaters.push(fn);
+
+// --- geometry helpers ------------------------------------------------
+const D2R = Math.PI / 180;
+const _q = new THREE.Quaternion(), _e = new THREE.Euler(), _s = new THREE.Vector3(), _p = new THREE.Vector3();
+/** Matrix from position [x,y,z], euler [rx,ry,rz] (radians), scale (number|[x,y,z]). */
+function T(pos = [0, 0, 0], rot = [0, 0, 0], scl = 1) {
+  _p.set(pos[0], pos[1], pos[2]);
+  _q.setFromEuler(_e.set(rot[0], rot[1], rot[2], rot[3] || 'XYZ'));
+  if (typeof scl === 'number') _s.set(scl, scl, scl); else _s.set(scl[0], scl[1], scl[2]);
+  return new THREE.Matrix4().compose(_p, _q, _s);
+}
+/** Normalise a geometry so it can be merged: non-indexed, position/normal/uv only, no groups. */
+function prep(geo) {
+  let g = geo.index ? geo.toNonIndexed() : geo;
+  for (const k of Object.keys(g.attributes)) if (!['position', 'normal', 'uv'].includes(k)) g.deleteAttribute(k);
+  if (!g.attributes.normal) g.computeVertexNormals();
+  if (!g.attributes.uv) g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
+  g.clearGroups();
+  g.morphAttributes = {};
+  return g;
+}
+const G = {
+  box: (w, h, d) => new THREE.BoxGeometry(w, h, d),
+  rbox: (w, h, d, r = 0.01, seg = 2) => new RoundedBoxGeometry(w, h, d, seg, Math.min(r, w / 2 - 1e-4, h / 2 - 1e-4, d / 2 - 1e-4)),
+  cyl: (rt, rb, h, seg = 24, open = false) => new THREE.CylinderGeometry(rt, rb, h, seg, 1, open),
+  cylX: (r, h, seg = 24, rb) => new THREE.CylinderGeometry(r, rb ?? r, h, seg).rotateZ(Math.PI / 2),
+  cylZ: (r, h, seg = 24, rb) => new THREE.CylinderGeometry(r, rb ?? r, h, seg).rotateX(Math.PI / 2),
+  torus: (R, r, rs = 8, ts = 24, arc = Math.PI * 2) => new THREE.TorusGeometry(R, r, rs, ts, arc),
+  sphere: (r, ws = 16, hs = 12) => new THREE.SphereGeometry(r, ws, hs),
+  /** Tube through 3D points [[x,y,z],...]. */
+  tube: (pts, r, seg = 32, rs = 8, closed = false, tension = 0.5) => new THREE.TubeGeometry(
+    new THREE.CatmullRomCurve3(pts.map(p => new THREE.Vector3(...p)), closed, 'catmullrom', tension), seg, r, rs, closed),
+  /** Polyline tube with sharp-ish bends (for handles, guards, rails). */
+  rail: (pts, r, rs = 8) => {
+    const path = new THREE.CurvePath();
+    for (let i = 0; i < pts.length - 1; i++) path.add(new THREE.LineCurve3(new THREE.Vector3(...pts[i]), new THREE.Vector3(...pts[i + 1])));
+    return new THREE.TubeGeometry(path, Math.max(2, (pts.length - 1) * 6), r, rs, false);
+  },
+  /** Side profile [[z,y],...] extruded across X (centred), with a bevel. */
+  extrudeX: (profile, halfW, bevel = 0.03, bevelSeg = 2) => {
+    const s = new THREE.Shape(profile.map(([z, y]) => new THREE.Vector2(z, y)));
+    const depth = Math.max(0.001, 2 * halfW - 2 * bevel);
+    const g = new THREE.ExtrudeGeometry(s, { depth, bevelEnabled: bevel > 0, bevelThickness: bevel, bevelSize: bevel, bevelSegments: bevelSeg, curveSegments: 4 });
+    g.translate(0, 0, -depth / 2);
+    g.rotateY(-Math.PI / 2);  // shape x -> world +z, extrusion -> world x
+    return g;
+  },
+  /** Plan/elevation shape [[a,b],...] extruded along its normal by depth. */
+  extrude: (pts, depth, bevel = 0, bevelSeg = 1, holes = []) => {
+    const s = new THREE.Shape(pts.map(([a, b]) => new THREE.Vector2(a, b)));
+    for (const h of holes) s.holes.push(new THREE.Path(h.map(([a, b]) => new THREE.Vector2(a, b))));
+    return new THREE.ExtrudeGeometry(s, { depth, bevelEnabled: bevel > 0, bevelThickness: bevel, bevelSize: bevel, bevelSegments: bevelSeg, curveSegments: 12 });
+  },
+  lathe: (pts, seg = 32) => new THREE.LatheGeometry(pts.map(([r, y]) => new THREE.Vector2(r, y)), seg),
+  hexBolt: (r = 0.012, h = 0.01) => {
+    const head = new THREE.CylinderGeometry(r, r, h, 6).translate(0, h / 2 + h * 0.25, 0);
+    const washer = new THREE.CylinderGeometry(r * 1.35, r * 1.35, h * 0.25, 12).translate(0, h * 0.125, 0);
+    return mergeGeometries([prep(head), prep(washer)]);
+  },
+};
+/** Loft closed rings of Vector3 (equal counts) into a faceted solid with end caps. */
+function loft(rings, capStart = true, capEnd = true) {
+  const pos = [];
+  const push = (a, b, c) => pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+  const n = rings[0].length;
+  for (let r = 0; r < rings.length - 1; r++) {
+    const A = rings[r], B = rings[r + 1];
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      push(A[i], B[i], B[j]); push(A[i], B[j], A[j]);
+    }
+  }
+  const cap = (R, flip) => {
+    const c = R.reduce((s, v) => s.add(v), new THREE.Vector3()).multiplyScalar(1 / R.length);
+    for (let i = 0; i < n; i++) { const j = (i + 1) % n; flip ? push(c, R[j], R[i]) : push(c, R[i], R[j]); }
+  };
+  if (capStart) cap(rings[0], false);
+  if (capEnd) cap(rings[rings.length - 1], true);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+/** Collects geometry per material, merges into one mesh per material. */
+class Kit {
+  constructor() { this.lists = new Map(); }
+  add(mat, geo, m) {
+    const g = prep(geo.clone());
+    if (m) g.applyMatrix4(m);
+    if (!this.lists.has(mat)) this.lists.set(mat, []);
+    this.lists.get(mat).push(g);
+    return this;
+  }
+  geometries() {
+    const out = new Map();
+    for (const [mat, list] of this.lists) out.set(mat, mergeGeometries(list));
+    return out;
+  }
+  build(name = 'kit', shadows = true) {
+    const grp = new THREE.Group(); grp.name = name;
+    for (const [mat, geo] of this.geometries()) {
+      const m = new THREE.Mesh(geo, mat);
+      m.castShadow = shadows; m.receiveShadow = true;
+      grp.add(m);
+    }
+    return grp;
+  }
+}
+
+/* =====================================================================
+   materials (base set; weathering shader is injected in Milestone 6)
+   ===================================================================== */
+const MAT = {
+  paint: new THREE.MeshStandardMaterial({ color: 0x4d5236, roughness: 0.66, metalness: 0.0, name: 'paint' }),
+};
+
+/* =====================================================================
+   lighting (basic sun + sky fill; presets come in Milestone 8)
+   ===================================================================== */
+const hemi = new THREE.HemisphereLight(0xbcd3ff, 0x9b7b55, 0.9);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffd7a8, 3.2);
+sun.position.set(-14, 9, 11);
+sun.target.position.set(0, 0.8, 0);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 50 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.02;
+scene.add(sun, sun.target);
+
+/* =====================================================================
+   desert (placeholder ground; full dune scene in Milestone 7)
+   ===================================================================== */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(600, 600).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ color: 0xc8a77a, roughness: 0.95 })
+);
+ground.receiveShadow = true;
+scene.add(ground);
+
+/* =====================================================================
+   tank root (hull, running gear, turret attach here)
+   ===================================================================== */
+const tank = new THREE.Group(); tank.name = 'tank';
+scene.add(tank);
+const proxy = new THREE.Mesh(G.rbox(3.6, 1.0, 7.9, 0.05), MAT.paint);
+proxy.position.y = 0.95; proxy.castShadow = true;
+tank.add(proxy);
+
+/* =====================================================================
+   ui (minimal for now)
+   ===================================================================== */
+document.getElementById('optSpin').addEventListener('change', e => { controls.autoRotate = e.target.checked; });
+
+/* =====================================================================
+   perf: FPS readout, resize
+   ===================================================================== */
+const fpsEl = document.getElementById('fps');
+let fpsFrames = 0, fpsTime = 0;
+onFrame((dt) => {
+  fpsFrames++; fpsTime += dt;
+  if (fpsTime >= 0.5) { fpsEl.textContent = `${(fpsFrames / fpsTime).toFixed(0)} fps`; fpsFrames = 0; fpsTime = 0; }
+});
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  renderer.setSize(w, h, false);
+}
+window.addEventListener('resize', onResize);
+
+/* =====================================================================
+   main loop
+   ===================================================================== */
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.1), t = clock.elapsedTime;
+  for (const fn of updaters) fn(dt, t);
+  controls.update(dt);
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(frame);
+
+window.APP = { THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit };
+</script>
+</body>
+</html>
