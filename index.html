@@ -42,7 +42,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* =====================================================================
    core: renderer, scene, camera, controls, geometry helpers
@@ -59,10 +59,9 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xc9b79a);
-scene.fog = new THREE.Fog(0xd2bb98, 60, 260);
+scene.fog = new THREE.Fog(0xd2bb98, 140, 1350);     // colour set from the sky horizon in desert()
 
-const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.1, 2000);
+const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.1, 4000);
 camera.position.set(10.5, 3.6, 11.5);
 
 const controls = new OrbitControls(camera, canvas);
@@ -219,9 +218,9 @@ const MAT = {
   // running gear variants (get mud)
   rgPaint:   std(0x4d5236, 0.66, 0.0, { name: 'rgPaint' }),
   rgRubber:  std(0x141413, 0.92, 0.0, { name: 'rgRubber' }),
-  rgSteel:   std(0x6b6a64, 0.45, 0.85, { name: 'rgSteel' }),
+  rgSteel:   std(0x5f5e59, 0.55, 0.55, { name: 'rgSteel' }),
   rgDark:    std(0x262624, 0.55, 0.6, { name: 'rgDark' }),
-  trackSteel: std(0x55534d, 0.5, 0.85, { name: 'trackSteel' }),
+  trackSteel: std(0x4a4945, 0.6, 0.5, { name: 'trackSteel' }),
   trackRubber: std(0x161615, 0.9, 0.0, { name: 'trackRubber' }),
 };
 // wire mesh for the bustle rack: one grid cell per UV unit, alpha-tested
@@ -345,7 +344,7 @@ const W = {
   uColGreen: { value: lin(0x4b5134) }, uColTan: { value: lin(0xb39d74) },
   uColNatoG: { value: lin(0x434d30) }, uColNatoB: { value: lin(0x5a4733) }, uColNatoK: { value: lin(0x232321) },
   uColTanOld: { value: lin(0xb09a72) }, uColSteel: { value: lin(0x6c6a64) }, uColRust: { value: lin(0x6e3b1d) },
-  uColDust: { value: lin(0xcdb894) }, uColMud: { value: lin(0x54493a) }, uColSoot: { value: lin(0x15130f) },
+  uColDust: { value: lin(0xcdb089) }, uColMud: { value: lin(0x54493a) }, uColSoot: { value: lin(0x15130f) },
   // oil sources (tank space xyz, radius): fuel caps, engine deck, rear plate
   uOil: { value: [[1.22, 1.16, 3.22, 0.28], [-1.22, 1.16, 3.22, 0.28], [1.32, 1.45, -3.48, 0.3], [-1.32, 1.45, -3.48, 0.3], [0.2, 1.45, -2.5, 0.55], [-0.5, 0.75, -3.9, 0.35]].map(a => new THREE.Vector4(...a)) },
   uSoot: { value: new THREE.Vector4(0, 1.07, -4.02, 1.15) },     // exhaust grille centre + reach
@@ -605,20 +604,472 @@ sun.position.set(-14, 9, 11);
 sun.target.position.set(0, 0.8, 0);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 50 });
-sun.shadow.bias = -0.0004;
-sun.shadow.normalBias = 0.02;
+Object.assign(sun.shadow.camera, { left: -15, right: 15, top: 15, bottom: -15, near: 20, far: 110 });
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.03;
 scene.add(sun, sun.target);
 
 /* =====================================================================
-   desert (placeholder ground; full dune scene in Milestone 7)
+   desert
+   Tank stays at the origin; the world scrolls by SCN.scroll along +Z.
+   Terrain height is a pure function of world (x, z) shared by GLSL and
+   JS, flattened along a meandering valley the tank drives in.
    ===================================================================== */
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(600, 600).rotateX(-Math.PI / 2),
-  new THREE.MeshStandardMaterial({ color: 0xc8a77a, roughness: 0.95 })
-);
-ground.receiveShadow = true;
+const SCN = { scroll: 0, lastScroll: NaN };
+const SUN_DIR = (() => { const el = 13 * D2R, h = new THREE.Vector2(0.9, 0.42).normalize();
+  return new THREE.Vector3(h.x * Math.cos(el), Math.sin(el), h.y * Math.cos(el)).normalize(); })();
+
+// --- shared noise / terrain functions (GLSL + JS mirror) -------------
+const NOISE_GLSL = /* glsl */`
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float vnoise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1.0, 0.0)), u.x), mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x), u.y); }
+float fbm2(vec2 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = p * 2.03 + vec2(17.1, 9.3); a *= 0.5; } return s; }`;
+const TERRAIN_GLSL = /* glsl */`
+uniform float uScroll;
+float duneH(vec2 p) {
+  vec2 w = vec2(fbm2(p * 0.006), fbm2(p * 0.006 + 11.7)) - 0.47;
+  vec2 q = p + w * 70.0;
+  float f1 = pow(fract(dot(q, vec2(0.94, 0.34)) / 95.0), 0.75);
+  float t1 = 1.0 - abs(2.0 * f1 - 1.0); t1 = t1 * t1 * (3.0 - 2.0 * t1);
+  float t2 = 1.0 - abs(2.0 * fract(dot(q, vec2(-0.42, 0.91)) / 57.0) - 1.0); t2 = t2 * t2 * (3.0 - 2.0 * t2);
+  float amp = 3.0 + 10.0 * fbm2(p * 0.004 + 3.3);
+  return amp * (t1 * 0.75 + t2 * 0.3) + 1.2 * fbm2(p * 0.03);
+}
+float terrainH(vec2 loc) {
+  vec2 p = vec2(loc.x, loc.y + uScroll);
+  float halfW = 15.0 + 14.0 * fbm2(vec2(p.y * 0.008, 4.1));
+  float m = smoothstep(halfW, halfW + 32.0, abs(p.x));
+  float swell = 0.9 * fbm2(p * 0.018 + 7.0) * smoothstep(22.0, 70.0, length(loc));
+  return duneH(p) * m + swell * (1.0 - m);
+}`;
+const fract = (x) => x - Math.floor(x);
+const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+function hash12(x, y) {
+  let a = fract(x * 0.1031), b = fract(y * 0.1031), c = fract(x * 0.1031);
+  const d = a * (b + 33.33) + b * (c + 33.33) + c * (a + 33.33); a += d; b += d; c += d;
+  return fract((a + b) * c);
+}
+function vnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash12(ix, iy), b = hash12(ix + 1, iy), c = hash12(ix, iy + 1), d = hash12(ix + 1, iy + 1);
+  return (a + (b - a) * ux) + ((c + (d - c) * ux) - (a + (b - a) * ux)) * uy;
+}
+function fbm2(x, y) { let a = 0.5, s = 0; for (let i = 0; i < 4; i++) { s += a * vnoise(x, y); x = x * 2.03 + 17.1; y = y * 2.03 + 9.3; a *= 0.5; } return s; }
+function duneH(x, z) {
+  const wx = fbm2(x * 0.006, z * 0.006) - 0.47, wz = fbm2(x * 0.006 + 11.7, z * 0.006 + 11.7) - 0.47;
+  const qx = x + wx * 70, qz = z + wz * 70;
+  const f1 = Math.pow(fract((qx * 0.94 + qz * 0.34) / 95), 0.75);
+  let t1 = 1 - Math.abs(2 * f1 - 1); t1 = t1 * t1 * (3 - 2 * t1);
+  let t2 = 1 - Math.abs(2 * fract((qx * -0.42 + qz * 0.91) / 57) - 1); t2 = t2 * t2 * (3 - 2 * t2);
+  const amp = 3 + 10 * fbm2(x * 0.004 + 3.3, z * 0.004 + 3.3);
+  return amp * (t1 * 0.75 + t2 * 0.3) + 1.2 * fbm2(x * 0.03, z * 0.03);
+}
+/** Terrain height at tank-local (x, z) for the current scroll. */
+function terrainH(lx, lz) {
+  const x = lx, z = lz + SCN.scroll;
+  const halfW = 15 + 14 * fbm2(z * 0.008, 4.1), m = sstep(halfW, halfW + 32, Math.abs(x));
+  const swell = 0.9 * fbm2(x * 0.018 + 7, z * 0.018 + 7) * sstep(22, 70, Math.hypot(lx, lz));
+  return duneH(x, z) * m + swell * (1 - m);
+}
+
+// --- sky dome: warm horizon, blue zenith, low sun, thin cirrus --------
+const SKY = {
+  uSunDir: { value: SUN_DIR.clone() }, uTime: { value: 0 }, uSkyI: { value: 1.0 }, uSunDisk: { value: 30.0 },
+  uZenith: { value: new THREE.Color(0.07, 0.19, 0.52) }, uHorizon: { value: new THREE.Color(1.0, 0.7, 0.42) }, uMid: { value: new THREE.Color(0.78, 0.74, 0.66) },
+  uGlow: { value: new THREE.Color(1.0, 0.5, 0.22) }, uCloud: { value: 1.0 },
+};
+function skyMaterial(disk = 1) {
+  return new THREE.ShaderMaterial({
+    uniforms: { ...SKY, uDiskMul: { value: disk } }, side: THREE.BackSide, depthWrite: false, fog: false,
+    vertexShader: /* glsl */`varying vec3 vDir; void main() { vDir = position; vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0); gl_Position = p.xyww; }`,
+    fragmentShader: /* glsl */`
+      uniform vec3 uSunDir, uZenith, uHorizon, uMid, uGlow; uniform float uTime, uSkyI, uSunDisk, uDiskMul, uCloud;
+      varying vec3 vDir;
+      ${NOISE_GLSL}
+      void main() {
+        vec3 d = normalize(vDir);
+        float h = d.y, t = pow(clamp(h, 0.0, 1.0), 0.5);
+        vec3 col = mix(uHorizon, uMid, smoothstep(0.0, 0.14, h));
+        col = mix(col, uZenith, smoothstep(0.06, 0.75, t));
+        float cs = max(dot(d, uSunDir), 0.0);
+        col += uGlow * pow(cs, 5.0) * 0.55 * (1.0 - t * 0.8);
+        col += vec3(1.0, 0.78, 0.5) * pow(cs, 90.0) * 1.4;
+        if (h < 0.0) col = mix(uHorizon, uHorizon * vec3(0.82, 0.74, 0.66), clamp(-h * 5.0, 0.0, 1.0));
+        if (h > 0.0 && uCloud > 0.0) {                                   // thin cirrus, streaked along the wind
+          vec2 uv = d.xz / (h + 0.06) * 0.55 + vec2(uTime * 0.0035, uTime * 0.001);
+          vec2 r = vec2(uv.x * 0.94 + uv.y * 0.34, -uv.x * 0.34 + uv.y * 0.94);
+          float c = fbm2(r * vec2(0.9, 5.0) + fbm2(r * 0.6) * 1.5);
+          c = smoothstep(0.52, 0.86, c) * smoothstep(0.02, 0.3, h) * uCloud;
+          vec3 cc = mix(vec3(1.0, 0.72, 0.52), vec3(1.0, 0.9, 0.82), t) + uGlow * pow(cs, 4.0) * 0.7;
+          col = mix(col, cc * 1.15, c * 0.6);
+        }
+        col += vec3(1.0, 0.86, 0.62) * smoothstep(0.99984, 0.99992, cs) * uSunDisk * uDiskMul;
+        gl_FragColor = vec4(col * uSkyI, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  });
+}
+const sky = new THREE.Mesh(new THREE.SphereGeometry(1900, 64, 32), skyMaterial(1));
+sky.frustumCulled = false; sky.renderOrder = -10; sky.name = 'sky';
+scene.add(sky);
+onFrame((dt, t) => { SKY.uTime.value = t; sky.position.copy(camera.position); });
+
+// --- terrain (sand) ---------------------------------------------------
+function polarGrid(rMax = 1450, segs = 200, k = 1.045, r0 = 0.6) {
+  const radii = []; for (let i = 1; ; i++) { const r = r0 * (Math.pow(k, i) - 1); radii.push(Math.min(r, rMax)); if (r >= rMax) break; }
+  const pos = [0, 0, 0], idx = [];
+  for (const r of radii) for (let j = 0; j < segs; j++) { const a = j / segs * Math.PI * 2; pos.push(Math.cos(a) * r, 0, Math.sin(a) * r); }
+  for (let j = 0; j < segs; j++) idx.push(0, 1 + (j + 1) % segs, 1 + j);
+  for (let i = 0; i < radii.length - 1; i++) for (let j = 0; j < segs; j++) {
+    const a = 1 + i * segs + j, b = 1 + i * segs + (j + 1) % segs, c = a + segs, d = b + segs;
+    idx.push(a, b, d, a, d, c);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(new Array(pos.length).fill(0).map((_, i) => i % 3 === 1 ? 1 : 0), 3));
+  g.setIndex(idx);
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), rMax + 50);
+  return g;
+}
+const SAND = { uScroll: { value: 0 } };
+const sandMat = new THREE.MeshStandardMaterial({ color: 0xd2b588, roughness: 0.94, metalness: 0, name: 'sand' });
+sandMat.onBeforeCompile = (sh) => {
+  Object.assign(sh.uniforms, SAND);
+  sh.vertexShader = sh.vertexShader
+    .replace('#include <common>', '#include <common>\n' + NOISE_GLSL + TERRAIN_GLSL + '\nvarying vec3 vSandW; varying vec2 vLocal;')
+    .replace('#include <beginnormal_vertex>', /* glsl */`
+      vec2 tLoc = position.xz;
+      float tH = terrainH(tLoc), tHx = terrainH(tLoc + vec2(0.5, 0.0)), tHz = terrainH(tLoc + vec2(0.0, 0.5));
+      vec3 objectNormal = normalize(vec3(tH - tHx, 0.5, tH - tHz));`)
+    .replace('#include <begin_vertex>', /* glsl */`
+      vec3 transformed = vec3(position.x, tH, position.z);
+      vSandW = vec3(position.x, tH, position.z + uScroll); vLocal = position.xz;`);
+  sh.fragmentShader = sh.fragmentShader
+    .replace('#include <common>', '#include <common>\n' + NOISE_GLSL + '\nvarying vec3 vSandW; varying vec2 vLocal;')
+    .replace('#include <color_fragment>', /* glsl */`#include <color_fragment>
+      float sH = 0.0, sBand = 0.0;
+      {
+        vec2 pw = vSandW.xz;
+        float slope = 1.0 - normalize(cross(dFdx(vSandW), dFdy(vSandW))).y;
+        float nA = fbm2(pw * 0.07), nB = fbm2(pw * 0.9 + 3.0);
+        vec3 sc = diffuseColor.rgb * (0.86 + 0.22 * nA) * mix(vec3(1.0), vec3(1.05, 0.97, 0.88), nB);
+        sc *= 0.93 + 0.1 * smoothstep(0.0, 9.0, vSandW.y);
+        sc = mix(sc, sc * vec3(1.06, 0.95, 0.86), smoothstep(0.15, 0.5, slope) * 0.5);   // lee slopes a touch redder
+        // wind ripples: two warped parallel sets blended by low-frequency noise (anti-tiling)
+        float fp = length(fwidth(pw));
+        float fadeR = 1.0 - smoothstep(0.018, 0.06, fp);
+        float r1 = sin(dot(pw, vec2(0.94, 0.34)) * 41.0 + fbm2(pw * 0.35) * 14.0);
+        float r2 = sin(dot(pw, vec2(0.83, 0.56)) * 31.0 + fbm2(pw * 0.27 + 5.0) * 18.0);
+        float rb = smoothstep(0.35, 0.65, fbm2(pw * 0.11 + 2.0));
+        float rip = pow(mix(r1, r2, rb) * 0.5 + 0.5, 1.7);
+        float ripA = 0.006 * fadeR * (1.0 - smoothstep(0.2, 0.55, slope)) * (0.6 + 0.6 * fbm2(pw * 0.2));
+        // tread marks behind the tank (local x/z), pad imprints fixed in the world
+        float ax = abs(vLocal.x), lat = abs(ax - 1.455);
+        sBand = (1.0 - smoothstep(0.27, 0.34, lat)) * smoothstep(-3.2, -3.7, vLocal.y) * (1.0 - smoothstep(30.0, 140.0, -vLocal.y));
+        float ph = fract(pw.y / 0.193);
+        float imprint = smoothstep(0.04, 0.12, ph) * (1.0 - smoothstep(0.86, 0.94, ph)) * smoothstep(0.015, 0.045, lat) * (1.0 - smoothstep(0.24, 0.29, lat));
+        sH = rip * ripA * (1.0 - sBand) + sBand * (-0.01 - imprint * 0.005) + (nB - 0.5) * 0.0015 * fadeR;
+        sc *= 1.0 - sBand * (0.07 + 0.04 * imprint);
+        diffuseColor.rgb = sc;
+      }`)
+    .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.82, sBand);')
+    .replace('#include <normal_fragment_maps>', /* glsl */`#include <normal_fragment_maps>
+      {
+        vec2 dH = vec2(dFdx(sH), dFdy(sH));
+        vec3 sx = dFdx(-vViewPosition), sy = dFdy(-vViewPosition);
+        vec3 R1 = cross(sy, normal), R2 = cross(normal, sx);
+        float dt = dot(sx, R1) * faceDirection;
+        normal = normalize(abs(dt) * normal - sign(dt) * (dH.x * R1 + dH.y * R2));
+      }`);
+};
+sandMat.customProgramCacheKey = () => 'sand';
+sandMat.envMapIntensity = 0.75;
+const ground = new THREE.Mesh(polarGrid(), sandMat);
+ground.receiveShadow = true; ground.name = 'ground';
 scene.add(ground);
+
+// --- reflection map: same sky + sunlit sand + sun disk through PMREM ---
+const pmrem = new THREE.PMREMGenerator(renderer);
+function buildDesertEnv() {
+  const env = new THREE.Scene();
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(900, 48, 24), skyMaterial(0.25));
+  const sandAlbedo = new THREE.Color(0xd2b588);
+  const E = 4.2 * Math.max(SUN_DIR.y, 0) + 0.9;                     // sun + sky irradiance on the sand
+  const gnd = new THREE.Mesh(new THREE.CircleGeometry(800, 48).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: sandAlbedo.clone().multiplyScalar(E / Math.PI) }));
+  gnd.position.y = -1.6;
+  env.add(dome, gnd);
+  const rt = pmrem.fromScene(env, 0.0, 0.1, 3000);
+  dome.geometry.dispose(); gnd.geometry.dispose();
+  return rt.texture;
+}
+
+// --- distant mesas -----------------------------------------------------
+function mesaGeo(rng, R, H) {
+  const prof = [[R * 1.25, -4], [R * 1.12, H * 0.12], [R * 0.86, H * 0.28], [R * 0.74, H * 0.34], [R * 0.72, H * 0.6], [R * 0.68, H * 0.64],
+    [R * 0.66, H * 0.93], [R * 0.6, H], [R * 0.3, H + 1.5], [0, H + 2]];
+  const g = new THREE.LatheGeometry(prof.map(([r, y]) => new THREE.Vector2(r, y)), 72);
+  const p = g.attributes.position, ph = [rng() * 10, rng() * 10, rng() * 10];
+  const col = new Float32Array(p.count * 3), c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i), a = Math.atan2(z, x);
+    const k = 1 + 0.16 * Math.sin(a * 3 + ph[0]) + 0.08 * Math.sin(a * 7 + ph[1]) + 0.04 * Math.sin(a * 17 + ph[2]) + (y < H * 0.3 ? 0.05 * Math.sin(a * 23) : 0);
+    p.setX(i, x * k); p.setZ(i, z * k);
+    const band = 0.5 + 0.5 * Math.sin(y * 0.45 + Math.sin(a * 2) * 0.6);
+    c.setHex(y > H * 0.9 ? 0x9e6e4c : y < H * 0.3 ? 0xb58c66 : 0xa5694a).multiplyScalar(0.85 + 0.25 * band);
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+// --- smooth weathered rocks, dry shrubs --------------------------------
+function rockGeo(seed) {
+  const rng = mulberry32(seed);
+  let g = new THREE.IcosahedronGeometry(1, 3); g.deleteAttribute('normal'); g.deleteAttribute('uv');
+  g = mergeVertices(g);
+  const dirs = Array.from({ length: 8 }, () => new THREE.Vector3(rng() * 2 - 1, rng() * 2 - 1, rng() * 2 - 1).normalize());
+  const amps = dirs.map(() => 0.12 + rng() * 0.28), v = new THREE.Vector3(), p = g.attributes.position;
+  const col = new Float32Array(p.count * 3), c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    v.fromBufferAttribute(p, i);
+    let k = 0.85; dirs.forEach((d, j) => { k += amps[j] * Math.pow(Math.max(0, v.dot(d)), 3); });
+    v.multiplyScalar(k); v.y = Math.max(v.y * 0.8, -0.35);
+    p.setXYZ(i, v.x, v.y, v.z);
+    c.setHex(0x8f7660).multiplyScalar(0.78 + 0.28 * Math.max(0, v.y) + 0.1 * Math.sin(v.y * 9 + v.x * 3));
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  return g;
+}
+function shrubKits(seed) {
+  const rng = mulberry32(seed), k = new Kit(), up = new THREE.Vector3(0, 1, 0), q = new THREE.Quaternion();
+  const twigM = SCENE_MAT.twig, leafM = SCENE_MAT.leaf;
+  for (let i = 0; i < 36; i++) {
+    const a = rng() * Math.PI * 2, tilt = 0.2 + rng() * 1.0, len = 0.25 + rng() * 0.55;
+    const d = new THREE.Vector3(Math.cos(a) * Math.sin(tilt), Math.cos(tilt), Math.sin(a) * Math.sin(tilt));
+    q.setFromUnitVectors(up, d);
+    const m = new THREE.Matrix4().compose(d.clone().multiplyScalar(len / 2), q, new THREE.Vector3(1, 1, 1));
+    k.add(twigM, new THREE.CylinderGeometry(0.003, 0.008, len, 3, 1, true), m);
+    const tip = d.clone().multiplyScalar(len);
+    for (let j = 0; j < 3; j++) if (rng() < 0.7) {
+      const o = new THREE.Vector3((rng() - 0.5) * 0.1, (rng() - 0.3) * 0.08, (rng() - 0.5) * 0.1).add(tip.clone().multiplyScalar(0.7 + rng() * 0.3));
+      k.add(leafM, new THREE.IcosahedronGeometry(0.018 + rng() * 0.022, 0), new THREE.Matrix4().makeTranslation(o.x, o.y, o.z));
+    }
+  }
+  return k.geometries();
+}
+const SCENE_MAT = {
+  mesa: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, name: 'mesa' }),
+  rock: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92, name: 'rock' }),
+  twig: new THREE.MeshStandardMaterial({ color: 0x6b5a48, roughness: 0.95, name: 'twig' }),
+  leaf: new THREE.MeshStandardMaterial({ color: 0x7d7f5c, roughness: 0.9, name: 'leaf' }),
+  concrete: new THREE.MeshStandardMaterial({ color: 0xb3a892, roughness: 0.92, name: 'concrete' }),
+  geotex: new THREE.MeshStandardMaterial({ color: 0xb8a27c, roughness: 1, name: 'geotextile' }),
+  wire: new THREE.MeshStandardMaterial({ color: 0x8a8a82, roughness: 0.5, metalness: 0.6, alphaMap: MAT.mesh.alphaMap, alphaTest: 0.5, side: THREE.DoubleSide, name: 'wire' }),
+  sandbag: new THREE.MeshStandardMaterial({ color: 0xa89270, roughness: 1, name: 'sandbag' }),
+  drumOlive: new THREE.MeshStandardMaterial({ color: 0x4f5533, roughness: 0.6, metalness: 0.3, name: 'drumOlive' }),
+  drumBlue: new THREE.MeshStandardMaterial({ color: 0x2c4865, roughness: 0.55, metalness: 0.3, name: 'drumBlue' }),
+  drumRust: new THREE.MeshStandardMaterial({ color: 0x74462a, roughness: 0.85, metalness: 0.2, name: 'drumRust' }),
+};
+
+// --- outpost: HESCO barriers, jersey barriers, drums, sandbags ----------
+function buildOutpost() {
+  const k = new Kit();
+  const hesco = (x, z) => {
+    k.add(SCENE_MAT.geotex, G.rbox(1.02, 1.0, 1.02, 0.06, 2), T([x, 0.5, z]));
+    for (const [px, pz, ry] of [[0.53, 0, Math.PI / 2], [-0.53, 0, Math.PI / 2], [0, 0.53, 0], [0, -0.53, 0]])
+      k.add(SCENE_MAT.wire, meshPanel(1.06, 1.02, 0.076), T([x + px, 0.51, z + pz], [0, ry, 0]));
+    k.add(SCENE_MAT.wire, meshPanel(1.06, 1.06, 0.076), T([x, 1.015, z], [-Math.PI / 2, 0, 0]));
+    k.add(SCENE_MAT.geotex, G.sphere(0.5, 14, 6).scale(1, 0.14, 1), T([x, 1.0, z]));
+  };
+  for (let i = 0; i < 5; i++) hesco(0, i * 1.06);
+  for (let i = 1; i < 4; i++) hesco(-i * 1.06, 4 * 1.06);
+  const jersey = [[0.3, 0], [0.3, 0.08], [0.2, 0.33], [0.08, 0.81], [-0.08, 0.81], [-0.2, 0.33], [-0.3, 0.08], [-0.3, 0]];
+  const jg = G.extrude(jersey, 3.0, 0.015, 1); jg.translate(0, 0, -1.5);
+  for (const [x, z, ry] of [[3.2, -2.5, 0.08], [3.4, 0.7, -0.05], [3.1, 3.9, 0.12]]) k.add(SCENE_MAT.concrete, jg, T([x, 0, z], [0, ry, 0]));
+  const drum = G.lathe([[0, 0], [0.285, 0], [0.29, 0.02], [0.29, 0.29], [0.3, 0.3], [0.29, 0.31], [0.29, 0.58], [0.3, 0.59], [0.29, 0.6], [0.29, 0.86], [0.285, 0.88], [0, 0.88]], 28);
+  const drums = [[1.5, -1.2, SCENE_MAT.drumOlive], [2.1, -1.0, SCENE_MAT.drumOlive], [1.8, -0.6, SCENE_MAT.drumBlue], [1.4, -0.3, SCENE_MAT.drumRust], [2.2, -0.3, SCENE_MAT.drumOlive], [1.2, 2.2, SCENE_MAT.drumBlue]];
+  for (const [x, z, m] of drums) {
+    k.add(m, drum, T([x, 0, z], [0, rand() * 6, 0]));
+    k.add(MAT.black, G.cyl(0.03, 0.03, 0.02, 10), T([x + 0.15, 0.89, z + 0.05]));
+  }
+  k.add(SCENE_MAT.drumRust, drum, T([2.0, 0.29, 1.4], [Math.PI / 2, 0.4, 0, 'YXZ']));
+  for (let row = 0; row < 3; row++) for (let i = 0; i < 6; i++)
+    k.add(SCENE_MAT.sandbag, G.rbox(0.6, 0.16, 0.36, 0.07, 3), T([-1.2 - i * 0.62 + (row % 2) * 0.31, 0.08 + row * 0.155, -1.6], [0, (rand() - 0.5) * 0.12, 0]));
+  const g = k.build('outpost');
+  g.traverse(o => { if (o.isMesh) o.castShadow = o.receiveShadow = true; });
+  return g;
+}
+
+// --- scenery placement: everything scrolls with SCN.scroll and wraps ---
+const props = [];          // { x, zw, L, yOff, apply(x,y,z) }
+const scenery = new THREE.Group(); scenery.name = 'scenery'; scene.add(scenery);
+function addProp(x, zw, L, yOff, apply) { props.push({ x, zw, L, yOff, apply }); }
+(() => {
+  const rng = mulberry32(777);
+  // mesas (far, wrap over +/-1300 m)
+  for (let i = 0; i < 9; i++) {
+    const a = rng() * Math.PI * 2, d = 700 + rng() * 450, R = 45 + rng() * 90, H = 22 + rng() * 48;
+    const m = new THREE.Mesh(mesaGeo(rng, R, H), SCENE_MAT.mesa); m.name = 'mesa';
+    scenery.add(m);
+    addProp(Math.cos(a) * d, Math.sin(a) * d, 2600, -6, (x, y, z) => m.position.set(x, y, z));
+  }
+  // rocks (instanced, a few close enough to cast shadows)
+  const rockVariants = [11, 23, 37, 41].map(rockGeo);
+  const perVar = 16;
+  rockVariants.forEach((geo, vi) => {
+    const im = new THREE.InstancedMesh(geo, SCENE_MAT.rock, perVar); im.castShadow = im.receiveShadow = true; im.frustumCulled = false;
+    scenery.add(im);
+    for (let i = 0; i < perVar; i++) {
+      let x, z; do { x = (rng() - 0.5) * 300; z = (rng() - 0.5) * 360; } while (Math.abs(x) < 7 && Math.abs(z) < 12);
+      if (vi === 0 && i < 3) { x = [9.5, -8.5, 12][i]; z = [-6, -9, 5][i]; }
+      const sc = (0.3 + rng() * rng() * 1.6), ry = rng() * 6.28, M = new THREE.Matrix4(), Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, ry, 0));
+      const S = new THREE.Vector3(sc * (0.8 + rng() * 0.6), sc * (0.75 + rng() * 0.5), sc * (0.8 + rng() * 0.6));
+      addProp(x, z, 360, -0.08 * sc, (px, py, pz) => { im.setMatrixAt(i, M.compose(new THREE.Vector3(px, py, pz), Q, S)); im.instanceMatrix.needsUpdate = true; });
+    }
+  });
+  // shrubs (instanced per variant and material)
+  for (let v = 0; v < 3; v++) {
+    const geos = shrubKits(100 + v), N = 45, ims = [];
+    for (const [mat, geo] of geos) { const im = new THREE.InstancedMesh(geo, mat, N); im.castShadow = false; im.receiveShadow = true; im.frustumCulled = false; ims.push(im); scenery.add(im); }
+    for (let i = 0; i < N; i++) {
+      let x, z; do { x = (rng() - 0.5) * 260; z = (rng() - 0.5) * 360; } while (Math.hypot(x, z) < 26);
+      const sc = 0.6 + rng() * 0.9, M = new THREE.Matrix4(), Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, rng() * 6.28, 0)), S = new THREE.Vector3(sc, sc * (0.7 + rng() * 0.5), sc);
+      addProp(x, z, 360, -0.03, (px, py, pz) => { M.compose(new THREE.Vector3(px, py, pz), Q, S); for (const im of ims) { im.setMatrixAt(i, M); im.instanceMatrix.needsUpdate = true; } });
+    }
+  }
+  // outpost
+  const op = buildOutpost(); op.rotation.y = -0.12; scenery.add(op);
+  addProp(-10.5, 7, 360, 0, (x, y, z) => op.position.set(x, y, z));
+})();
+function placeScenery() {
+  for (const p of props) {
+    const z = ((p.zw - SCN.scroll + p.L / 2) % p.L + p.L) % p.L - p.L / 2;
+    p.apply(p.x, terrainH(p.x, z) + p.yOff, z);
+  }
+}
+
+// --- particles: drifting sand + track dust ------------------------------
+function puffTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d');
+  const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.45, 'rgba(255,255,255,0.55)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  g.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i < 40; i++) { g.fillStyle = `rgba(0,0,0,${0.15 + rand() * 0.25})`; g.beginPath(); g.arc(rand() * 64, rand() * 64, 3 + rand() * 7, 0, 6.3); g.fill(); }
+  const t = new THREE.CanvasTexture(c); return t;
+}
+const PUFF = puffTexture();
+const PART_FRAG = /* glsl */`
+  uniform sampler2D uTex; uniform vec3 uColor; varying float vA;
+  void main() { vec4 t = texture2D(uTex, gl_PointCoord); gl_FragColor = vec4(uColor, t.a * vA); if (gl_FragColor.a < 0.004) discard;
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }`;
+const pxScale = () => renderer.domElement.height / (2 * Math.tan(camera.fov * D2R / 2));
+const drift = (() => {
+  const N = 1400, seed = new Float32Array(N * 4), rng = mulberry32(99);
+  for (let i = 0; i < N; i++) seed.set([(rng() - 0.5) * 70, rng() < 0.85 ? rng() * rng() * 1.6 : 0.2 + rng() * 1.5, (rng() - 0.5) * 70, rng()], i * 4);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+  g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 4));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 }, uScroll: SAND.uScroll, uScale: { value: 800 }, uTex: { value: PUFF }, uColor: { value: new THREE.Color(0.95, 0.8, 0.6) }, uAmt: { value: 1 } },
+    transparent: true, depthWrite: false,
+    vertexShader: /* glsl */`
+      uniform float uTime, uScroll, uScale, uAmt; attribute vec4 aSeed; varying float vA;
+      void main() {
+        bool wisp = aSeed.w > 0.85;
+        vec3 p = aSeed.xyz;
+        float sp = wisp ? 1.6 + aSeed.w * 1.5 : 3.0 + aSeed.w * 3.5;
+        p.xz += vec2(0.94, 0.34) * sp * uTime;
+        p.z -= uScroll;
+        p.x = mod(p.x + 35.0, 70.0) - 35.0; p.z = mod(p.z + 35.0, 70.0) - 35.0;
+        p.y += 0.12 * sin(uTime * (1.0 + aSeed.w) + aSeed.x);
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        float size = wisp ? 1.4 + aSeed.w * 1.2 : 0.035;
+        gl_PointSize = max(size * uScale / -mv.z, 1.2);
+        float edge = 1.0 - smoothstep(25.0, 35.0, max(abs(p.x), abs(p.z)));
+        vA = (wisp ? 0.05 : 0.45) * edge * uAmt * (1.0 - smoothstep(1.2, 3.0, p.y));
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: PART_FRAG,
+  });
+  const pts = new THREE.Points(g, mat); pts.frustumCulled = false; pts.renderOrder = 5; pts.name = 'driftingSand';
+  scene.add(pts);
+  onFrame((dt, t) => { mat.uniforms.uTime.value = t; mat.uniforms.uScale.value = pxScale(); });
+  return { pts, mat };
+})();
+const trackDust = (() => {
+  const N = 260, pos = new Float32Array(N * 3), size = new Float32Array(N), alpha = new Float32Array(N);
+  const vel = new Float32Array(N * 3), life = new Float32Array(N), age = new Float32Array(N).fill(1e9); let next = 0, acc = 0;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  g.setAttribute('aAlpha', new THREE.BufferAttribute(alpha, 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uScale: { value: 800 }, uTex: { value: PUFF }, uColor: { value: new THREE.Color(0.82, 0.68, 0.5) } },
+    transparent: true, depthWrite: false,
+    vertexShader: /* glsl */`uniform float uScale; attribute float aSize, aAlpha; varying float vA;
+      void main() { vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_PointSize = aSize * uScale / -mv.z; vA = aAlpha; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: PART_FRAG,
+  });
+  const pts = new THREE.Points(g, mat); pts.frustumCulled = false; pts.renderOrder = 6; pts.name = 'trackDust';
+  scene.add(pts);
+  function emit(x, y, z, vx, vy, vz, l) {
+    const i = next; next = (next + 1) % N;
+    pos.set([x, y, z], i * 3); vel.set([vx, vy, vz], i * 3); life[i] = l; age[i] = 0;
+  }
+  onFrame((dt) => {
+    mat.uniforms.uScale.value = pxScale();
+    const v = RG.speed || 0, sp = Math.abs(v);
+    acc += sp * dt * 7;
+    while (acc > 1) {
+      acc -= 1;
+      for (const sx of [1, -1]) {
+        const zEnd = v > 0 ? -3.35 : 3.3, back = Math.sign(v) || 1;
+        emit(sx * (RG.x + (rand() - 0.3) * 0.5), 0.15 + rand() * 0.2, zEnd + (rand() - 0.5) * 0.6,
+          sx * (0.2 + rand() * 0.5), 0.4 + rand() * 0.6 * Math.min(1, sp / 4), -back * (0.3 + rand() * 0.8), 2.2 + rand() * 2.2);
+        if (rand() < 0.35) emit(sx * (RG.x + 0.2), 0.6 + rand() * 0.3, v > 0 ? -3.0 : 2.9, sx * 0.4, 0.7, -back * 0.5, 1.6 + rand());
+      }
+    }
+    for (let i = 0; i < N; i++) {
+      const a = (age[i] += dt);
+      if (a > life[i]) { alpha[i] = 0; size[i] = 0; continue; }
+      const k = a / life[i];
+      pos[i * 3] += vel[i * 3] * dt; pos[i * 3 + 1] += vel[i * 3 + 1] * dt; pos[i * 3 + 2] += (vel[i * 3 + 2] - v) * dt;   // world scrolls by -v
+      vel[i * 3 + 1] *= 1 - dt * 0.6; vel[i * 3] *= 1 - dt * 0.4; vel[i * 3 + 2] *= 1 - dt * 0.4;
+      vel[i * 3] += 0.94 * 0.6 * dt; vel[i * 3 + 2] += 0.34 * 0.6 * dt;                                                     // wind
+      size[i] = 0.5 + k * 3.2; alpha[i] = 0.32 * Math.min(1, a * 4) * (1 - k) * (1 - k);
+    }
+    g.attributes.position.needsUpdate = g.attributes.aSize.needsUpdate = g.attributes.aAlpha.needsUpdate = true;
+  });
+  return { pts };
+})();
+
+// --- scrolling -----------------------------------------------------------
+onFrame((dt) => {
+  SCN.scroll += (RG.speed || 0) * dt;
+  SAND.uScroll.value = SCN.scroll;
+  if (SCN.scroll !== SCN.lastScroll) { placeScenery(); SCN.lastScroll = SCN.scroll; }
+});
+
+/** Apply the desert look: sun, sky, fog, reflection map. */
+function applyDesert() {
+  sun.position.copy(SUN_DIR).multiplyScalar(60);
+  sun.color.setHex(0xffc58e); sun.intensity = 4.2;
+  hemi.intensity = 0.0;
+  const hz = SKY.uHorizon.value.clone().lerp(SKY.uMid.value, 0.3).multiplyScalar(SKY.uSkyI.value);
+  scene.fog.color.copy(hz); scene.fog.near = 60; scene.fog.far = 1250;
+  if (!SCN.desertEnv) SCN.desertEnv = buildDesertEnv();
+  scene.environment = SCN.desertEnv;
+  sky.visible = ground.visible = scenery.visible = drift.pts.visible = true;
+}
 
 /* =====================================================================
    tank root (hull, running gear, turret attach here)
@@ -976,21 +1427,21 @@ function rollerKit(r) {
 function trackLinkKits() {
   const st = new Kit(), rb = new Kit(), P = RG.pitch;
   for (const sx of [1, -1]) {
-    st.add(MAT.trackSteel, G.rbox(0.252, 0.042, 0.172, 0.012), T([sx * 0.155, -0.021, 0]));
+    st.add(MAT.trackSteel, G.rbox(0.252, 0.042, 0.172, 0.012, 1), T([sx * 0.155, -0.021, 0]));
     // rubber bushing bosses + split rubber pads
-    st.add(MAT.trackSteel, G.cylX(0.022, 0.25, 10), T([sx * 0.155, -0.02, P * 0.33]));
-    st.add(MAT.trackSteel, G.cylX(0.022, 0.25, 10), T([sx * 0.155, -0.02, -P * 0.33]));
-    rb.add(MAT.trackRubber, G.rbox(0.232, 0.043, 0.162, 0.012), T([sx * 0.155, -0.062, 0]));
+    st.add(MAT.trackSteel, G.cylX(0.022, 0.25, 8), T([sx * 0.155, -0.02, P * 0.33]));
+    st.add(MAT.trackSteel, G.cylX(0.022, 0.25, 8), T([sx * 0.155, -0.02, -P * 0.33]));
+    rb.add(MAT.trackRubber, G.rbox(0.232, 0.043, 0.162, 0.012, 1), T([sx * 0.155, -0.062, 0]));
     rb.add(MAT.trackRubber, G.box(0.012, 0.012, 0.14), T([sx * 0.155, -0.084, 0]));   // centre tread ridge   // centre groove ridge
     // end connector + wedge + wedge bolt at the joint
-    st.add(MAT.trackSteel, G.rbox(0.048, 0.07, 0.1, 0.01), T([sx * 0.336, -0.018, P / 2]));
+    st.add(MAT.trackSteel, G.rbox(0.048, 0.07, 0.1, 0.01, 1), T([sx * 0.336, -0.018, P / 2]));
     st.add(MAT.trackSteel, G.box(0.03, 0.03, 0.06), T([sx * 0.336, 0.028, P / 2], [0.3, 0, 0]));
     st.add(MAT.trackSteel, G.hexBolt(0.013, 0.014), T([sx * 0.336, 0.04, P / 2]));
     st.add(MAT.trackSteel, G.hexBolt(0.011, 0.01), T([sx * 0.36, -0.018, P / 2], [0, 0, -sx * Math.PI / 2]));
   }
   // centre guide connector with guide horn
-  st.add(MAT.trackSteel, G.rbox(0.09, 0.045, 0.11, 0.01), T([0, -0.02, P / 2]));
-  st.add(MAT.trackSteel, G.rbox(0.05, 0.1, 0.075, 0.012), T([0, 0.05, P / 2]));
+  st.add(MAT.trackSteel, G.rbox(0.09, 0.045, 0.11, 0.01, 1), T([0, -0.02, P / 2]));
+  st.add(MAT.trackSteel, G.rbox(0.05, 0.1, 0.075, 0.012, 1), T([0, 0.05, P / 2]));
   st.add(MAT.trackSteel, G.hexBolt(0.01, 0.01), T([0.045, -0.02, P / 2], [0, 0, -Math.PI / 2]));
   return { steel: st.geometries().get(MAT.trackSteel), rubber: rb.geometries().get(MAT.trackRubber) };
 }
@@ -1615,6 +2066,7 @@ weather(MAT.trackSteel, { mud: true, mudRad: 0, rusty: true });
 weather(MAT.trackRubber, { mud: true, mudRad: 0, bump: 1.5 });
 weather(MAT.decal, { decal: true, bump: 0.5 });
 onFrame(() => { tank.updateMatrixWorld(); W.uTankInv.value.copy(tank.matrixWorld).invert(); });
+applyDesert();
 
 /* =====================================================================
    ui (minimal for now)
@@ -1629,10 +2081,10 @@ document.getElementById('optWear').addEventListener('input', e => { W.uWear.valu
    perf: FPS readout, resize
    ===================================================================== */
 const fpsEl = document.getElementById('fps');
-let fpsFrames = 0, fpsTime = 0;
-onFrame((dt) => {
-  fpsFrames++; fpsTime += dt;
-  if (fpsTime >= 0.5) { fpsEl.textContent = `${(fpsFrames / fpsTime).toFixed(0)} fps`; fpsFrames = 0; fpsTime = 0; }
+let fpsFrames = 0, fpsT0 = performance.now();
+onFrame(() => {
+  fpsFrames++; const now = performance.now(), el = (now - fpsT0) / 1000;
+  if (el >= 0.5) { fpsEl.textContent = `${(fpsFrames / el).toFixed(el > 2 ? 1 : 0)} fps`; fpsFrames = 0; fpsT0 = now; }
 });
 function onResize() {
   const w = window.innerWidth, h = window.innerHeight;
@@ -1652,7 +2104,7 @@ function frame() {
 }
 renderer.setAnimationLoop(frame);
 
-window.APP = { W, RG, THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
+window.APP = { SCN, SKY, W, RG, THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
 </script>
 </body>
 </html>

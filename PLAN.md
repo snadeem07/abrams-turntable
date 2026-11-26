@@ -21,7 +21,7 @@ Shared helpers (beveled extrusions, lofts, bolt and strap generators, merge-and-
 - [x] **M5 – Active protection units.** One unit on each turret side, on standoff brackets: a box with a slanted front, a ribbed radar face looking forward and out, access panel and latches, a turning launcher with two ports, cables into the turret, and an aft radar on a post. A toggle hides them.
 - **CHECKPOINT:** switch to Fable 5.2 at max effort (or Opus 5.5 at max effort).
 - [x] **M6 – Materials and weathering.** Triplanar weathering injected with onBeforeCompile; Green 383, NATO three-tone and desert tan finishes; dust and wear sliders; stencil decals.
-- [ ] **M7 – Desert scene.** Vertex-displaced dunes, wind ripples, sky dome with cirrus, mesas, rocks, shrubs, outpost, tread marks, scenery that wraps while driving, PMREM environment, drifting sand and track dust.
+- [x] **M7 – Desert scene.** Vertex-displaced dunes, wind ripples, sky dome with cirrus, mesas, rocks, shrubs, outpost, tread marks, scenery that wraps while driving, PMREM environment, drifting sand and track dust.
 - [ ] **M8 – Lighting presets and post-processing.** Studio cyclorama, Noir and Night presets; PCSS soft shadows; GTAO; contact shade; vignette and grain; white-hot thermal mode with reticle.
 - **CHECKPOINT:** switch to Sonnet 5.5 at high effort.
 - [ ] **M9 – Interaction.** Driving, turret traverse, gun elevation, firing effects, hatches.
@@ -60,3 +60,4 @@ Shared helpers (beveled extrusions, lofts, bolt and strap generators, merge-and-
 
 ## Notes and limitations
 - The three.js CDN may be blocked in the build container. In that case three@0.160 is installed with npm for local testing only, and the shipped importmap still points to the CDN.
+- Browser checks run in headless Chromium with SwiftShader (CPU rendering), so frame rates measured there (around 1 fps for the full scene) are not representative of a GPU. Use them only to compare one build against another. After M7 the scene is about 860k triangles (the track and wheels about 310k, the scenery about 300k). The shrubs and rocks were reduced from 2.6M triangles, and the shrubs do not cast shadows.
