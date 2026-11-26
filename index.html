@@ -199,7 +199,22 @@ const MAT = {
   headlamp:  std(0xd8d4c8, 0.12, 0.1, { name: 'headlamp', emissive: 0x000000 }),
   lensRed:   std(0x7a0d08, 0.2, 0.0, { name: 'lensRed', emissive: 0x2a0302 }),
   lensAmber: std(0xa8650f, 0.2, 0.0, { name: 'lensAmber', emissive: 0x000000 }),
+  canvas:    std(0x5b5a3e, 0.95, 0.0, { name: 'canvas' }),           // mantlet cover, bedroll
+  canvasTan: std(0x8a7a56, 0.95, 0.0, { name: 'canvasTan' }),
+  strap:     std(0x383a29, 0.85, 0.0, { name: 'strap' }),
+  cardboard: std(0x9a8461, 0.9, 0.0, { name: 'cardboard' }),
+  cooler:    std(0xbfb49a, 0.5, 0.0, { name: 'cooler' }),
+  waterCan:  std(0x9c8a5f, 0.55, 0.0, { name: 'waterCan' }),
+  camNet:    std(0x585b3a, 1.0, 0.0, { name: 'camNet' }),
 };
+// wire mesh for the bustle rack: one grid cell per UV unit, alpha-tested
+MAT.mesh = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d'); g.fillStyle = '#000'; g.fillRect(0, 0, 64, 64);
+  g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 9); g.fillRect(0, 0, 9, 64);
+  const tex = new THREE.CanvasTexture(c); tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return std(0x4d5236, 0.6, 0.2, { name: 'mesh', alphaMap: tex, alphaTest: 0.5, side: THREE.DoubleSide });
+})();
 
 /* =====================================================================
    lighting (basic sun + sky fill; presets come in Milestone 8)
@@ -696,6 +711,393 @@ onFrame((dt) => {
   RG.dist += (RG.speed || 0) * dt;
   if (RG.dist !== lastTrackDist || RG.dirty) { runningGear.update(); lastTrackDist = RG.dist; RG.dirty = false; }
 });
+
+/* =====================================================================
+   turret
+   Body lofted from cross-sections (front slanted, cheeks angled in plan,
+   undercut sides, raised bustle). Gun, hatches, CITV head, RWS, loader MG
+   and whips are separate groups so they can move.
+   Local frame: origin = turret ring centre at deck height, +Z forward.
+   ===================================================================== */
+const TUR = { y: 1.40, z: HULL.turretRingZ, roof: 0.97, trunnion: [0, 0.52, 1.30] };
+function turretSection(zb, zt, bw, sw, sw2, rw, top, yb = 0.10) {
+  const ylo = 0.30, yhi = 0.80;
+  const zAt = (y) => zb + (zt - zb) * (y - yb) / (top - yb);
+  const P = (x, y) => new THREE.Vector3(x, y, zAt(y));
+  return [P(-bw, yb), P(bw, yb), P(sw, ylo), P(sw2, yhi), P(rw, top - 0.07), P(rw - 0.08, top), P(-(rw - 0.08), top), P(-rw, top - 0.07), P(-sw2, yhi), P(-sw, ylo)];
+}
+/** Wire-mesh panel w x h in its XY plane, UVs scaled so one cell is ~5 cm. */
+function meshPanel(w, h, cell = 0.075) {
+  const g = new THREE.PlaneGeometry(w, h); const uv = g.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * w / cell, uv.getY(i) * h / cell);
+  return g;
+}
+/** Bumpy roll (cam net) along X. */
+function lumpyRoll(r, len, seed = 1) {
+  const g = new THREE.CylinderGeometry(r, r, len, 28, 14).rotateZ(Math.PI / 2);
+  const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i), a = Math.atan2(z, y), rr = Math.hypot(y, z);
+    if (rr < 1e-4) continue;
+    const k = 1 + 0.07 * Math.sin(a * 5 + x * 9 + seed) + 0.05 * Math.sin(a * 11 - x * 17 + seed * 2) + 0.04 * Math.sin(x * 23 + a * 3);
+    const end = Math.min(1, (len / 2 - Math.abs(x)) / 0.06 + 0.6);
+    p.setY(i, y * k * end); p.setZ(i, z * k * end);
+  }
+  g.computeVertexNormals();
+  return g;
+}
+function jerryCanKit(k, m) {
+  k.add(MAT.waterCan, G.rbox(0.17, 0.46, 0.34, 0.03), mul(m, T([0, 0.23, 0])));
+  for (const sx of [1, -1]) {   // X emboss
+    k.add(MAT.waterCan, G.rbox(0.012, 0.42, 0.03, 0.006), mul(m, T([sx * 0.088, 0.21, 0], [0.62, 0, 0])));
+    k.add(MAT.waterCan, G.rbox(0.012, 0.42, 0.03, 0.006), mul(m, T([sx * 0.088, 0.21, 0], [-0.62, 0, 0])));
+  }
+  for (const dz of [-0.1, 0, 0.1]) k.add(MAT.waterCan, G.rbox(0.03, 0.06, 0.025, 0.008), mul(m, T([0, 0.48, dz])));
+  k.add(MAT.waterCan, G.rbox(0.035, 0.02, 0.26, 0.008), mul(m, T([0, 0.51, 0])));
+  k.add(MAT.black, G.cyl(0.03, 0.03, 0.04, 12), mul(m, T([0, 0.47, 0.13])));
+}
+function hatchKit(r, opts = {}) {
+  const k = new Kit();
+  k.add(MAT.paint, G.cyl(r, r + 0.012, 0.06, 36), T([r, 0.03, 0]));
+  k.add(MAT.paint, G.cyl(r - 0.07, r - 0.03, 0.03, 36), T([r, 0.075, 0]));
+  k.add(MAT.steel, G.rail([[r - 0.08, 0.06, 0.12], [r - 0.08, 0.1, 0.12], [r + 0.08, 0.1, 0.12], [r + 0.08, 0.06, 0.12]], 0.009));
+  k.add(MAT.darkSteel, G.cylZ(0.03, 0.2, 14), T([0, 0.03, 0]));
+  k.add(MAT.paint, G.rbox(0.12, 0.05, 0.22, 0.015), T([0.06, 0.035, 0]));
+  return k;
+}
+
+function buildTurret() {
+  const root = new THREE.Group(); root.name = 'turret';
+  root.position.set(0, TUR.y, TUR.z);
+  const k = new Kit(), R = TUR.roof;
+
+  // --- lofted body ---
+  const rings = [
+    turretSection(1.72, 1.52, 0.62, 0.74, 0.72, 0.66, 0.93),
+    turretSection(1.66, 1.47, 0.68, 0.80, 0.78, 0.72, 0.96),
+    turretSection(0.72, 0.72, 1.25, 1.60, 1.58, 1.48, R),
+    turretSection(-1.15, -1.15, 1.25, 1.60, 1.58, 1.48, R),
+    turretSection(-1.35, -1.35, 1.22, 1.58, 1.57, 1.47, R, 0.24),
+    turretSection(-2.62, -2.62, 1.18, 1.50, 1.48, 1.40, R, 0.24),
+    turretSection(-2.70, -2.70, 1.12, 1.44, 1.43, 1.34, 0.93, 0.28),
+  ];
+  k.add(MAT.paint, loft(rings));
+  k.add(MAT.darkSteel, G.cyl(1.06, 1.06, 0.12, 64), T([0, 0.05, 0]));      // turret ring skirt
+
+  // --- mantlet face + coax port ---
+  k.add(MAT.paint, G.rbox(0.9, 0.62, 0.08, 0.03), T([0, 0.53, 1.66], [-0.1, 0, 0]));
+  k.add(MAT.darkSteel, G.cylZ(0.03, 0.1, 14), T([-0.36, 0.5, 1.72]));
+  k.add(MAT.black, G.cylZ(0.016, 0.02, 12), T([-0.36, 0.5, 1.775]));
+
+  // --- roof armour cover bolts over the cheeks + front edge ---
+  const bolt = G.hexBolt(0.016, 0.011);
+  for (const sx of [1, -1]) {
+    const hw = (z) => 0.64 + (1.47 - z) / 0.75 * 0.76;            // flat-roof half width over the cheeks
+    for (const off of [0.07, 0.24]) for (let t = 0; t <= 1.0001; t += 1 / 7) {
+      const z = 1.38 - t * 0.56 - off * 0.35; k.add(MAT.paint, bolt, T([sx * (hw(z) - 0.08 - off), R, z]));
+    }
+    for (let z = 0.6; z >= -1.0; z -= 0.32) k.add(MAT.paint, bolt, T([sx * 1.3, R, z]));
+  }
+  for (let x = -0.5; x <= 0.51; x += 0.2) k.add(MAT.paint, bolt, T([x, 0.935, 1.5]));
+
+  // --- bustle roof blow-off panels ---
+  for (const sx of [1, -1]) {
+    const cx = sx * 0.72, cz = -2.12, w = 1.1, l = 0.82;
+    k.add(MAT.paint, G.rbox(w, 0.025, l, 0.008), T([cx, R + 0.012, cz]));
+    for (let t = 0; t <= 1.0001; t += 0.2) {
+      k.add(MAT.paint, G.hexBolt(0.011, 0.008), T([cx - w / 2 + 0.03 + t * (w - 0.06), R + 0.025, cz + l / 2 - 0.03]));
+      k.add(MAT.paint, G.hexBolt(0.011, 0.008), T([cx - w / 2 + 0.03 + t * (w - 0.06), R + 0.025, cz - l / 2 + 0.03]));
+    }
+  }
+  k.add(MAT.paint, G.sphere(0.16, 20, 10).scale(1, 0.45, 1), T([0, R, -1.45]));        // ventilator dome
+  k.add(MAT.paint, G.cyl(0.18, 0.19, 0.03, 24), T([0, R + 0.01, -1.45]));
+
+  // --- lifting eyes ---
+  const eye = towEyeGeo().scale(0.8, 0.8, 0.8);
+  for (const [x, z] of [[1.3, 0.5], [-1.3, 0.5], [1.22, -2.4], [-1.22, -2.4]])
+    k.add(MAT.paint, eye, T([x, R + 0.02, z], [-Math.PI / 2, 0, 0, 'YXZ']));
+
+  // --- smoke grenade launchers on the cheeks (2 x 3 tubes) ---
+  for (const sx of [1, -1]) {
+    const yaw = Math.atan2(0.76 * sx, 0.65);
+    const m = T([sx * 1.24, 0.66, 1.16], [0, yaw, 0]);
+    k.add(MAT.paint, G.rbox(0.42, 0.08, 0.2, 0.02), mul(m, T([0, -0.05, 0.05])));
+    for (let row = 0; row < 2; row++) for (let c = 0; c < 3; c++) {
+      const tm = mul(m, T([(c - 1) * 0.095, 0.03 + row * 0.085, 0.06 + row * 0.02], [-0.65 - row * 0.15, 0, 0]));
+      k.add(MAT.paint, G.cylZ(0.038, 0.24, 18), mul(tm, T([0, 0, 0.1])));
+      k.add(MAT.rubber, G.cylZ(0.04, 0.02, 18), mul(tm, T([0, 0, 0.225])));
+      k.add(MAT.darkSteel, G.cylZ(0.044, 0.025, 18), mul(tm, T([0, 0, -0.01])));
+    }
+    k.add(MAT.strap, G.cylX(0.008, 0.36, 8), mul(m, T([0, 0.02, 0.18])));     // cable conduit
+  }
+
+  // --- gunner's primary sight (right front) ---
+  {
+    const m = T([-0.95, R, 1.02]);
+    k.add(MAT.paint, G.rbox(0.56, 0.34, 0.62, 0.03), mul(m, T([0, 0.17, 0])));
+    k.add(MAT.glass, G.box(0.36, 0.17, 0.01), mul(m, T([0, 0.18, 0.31], [-0.12, 0, 0])));
+    for (const sx of [1, -1]) {
+      k.add(MAT.paint, G.rbox(0.2, 0.22, 0.03, 0.008), mul(m, T([sx * 0.25, 0.18, 0.33], [0, sx * 0.85, 0])));    // ballistic doors (open)
+      k.add(MAT.darkSteel, G.cyl(0.015, 0.015, 0.22, 10), mul(m, T([sx * 0.2, 0.18, 0.32])));
+    }
+    k.add(MAT.paint, G.rbox(0.6, 0.03, 0.16, 0.01), mul(m, T([0, 0.35, 0.32])));
+    for (const [x, z] of [[-0.23, -0.25], [0.23, -0.25], [-0.23, 0.2], [0.23, 0.2]]) k.add(MAT.paint, G.hexBolt(0.013, 0.009), mul(m, T([x, 0.34, z])));
+  }
+
+  // --- side stowage boxes ---
+  for (const sx of [1, -1]) {
+    const x = sx * 1.75, z0 = -0.45, z1 = -1.85, zc = (z0 + z1) / 2, l = z0 - z1;
+    k.add(MAT.paint, G.rbox(0.3, 0.5, l, 0.025), T([x, 0.62, zc]));
+    k.add(MAT.paint, G.rbox(0.33, 0.035, l + 0.02, 0.012), T([x, 0.885, zc]));               // lid
+    for (const dz of [-0.45, 0, 0.45]) {
+      k.add(MAT.darkSteel, G.rbox(0.03, 0.08, 0.06, 0.008), T([x + sx * 0.16, 0.8, zc + dz]));        // latches
+      k.add(MAT.steel, G.cylZ(0.006, 0.05, 6), T([x + sx * 0.172, 0.77, zc + dz]));
+    }
+    for (const dz of [-0.5, 0.5]) k.add(MAT.darkSteel, G.cylZ(0.014, 0.12, 10), T([x - sx * 0.13, 0.9, zc + dz]));   // hinges
+    k.add(MAT.steel, G.rail([[x + sx * 0.152, 0.55, zc - 0.12], [x + sx * 0.19, 0.55, zc - 0.12], [x + sx * 0.19, 0.55, zc + 0.12], [x + sx * 0.152, 0.55, zc + 0.12]], 0.009));
+    for (const dz of [-l / 2 + 0.05, l / 2 - 0.05]) k.add(MAT.paint, G.rbox(0.1, 0.06, 0.04, 0.01), T([x - sx * 0.17, 0.45, zc + dz]));
+  }
+
+  // --- bustle rack with kit ---
+  {
+    const z0 = -2.72, z1 = -3.42, zc = (z0 + z1) / 2, L = z0 - z1, W = 2.84, y0 = 0.22, y1 = 0.92;
+    const fr = [];
+    for (const sx of [1, -1]) {
+      fr.push([[sx * W / 2, y0, z0], [sx * W / 2, y0, z1], [sx * W / 2, y1, z1], [sx * W / 2, y1, z0]]);
+      for (const z of [z0 + 0.02, (z0 + z1) / 2, z1]) fr.push([[sx * W / 2, y0, z], [sx * W / 2, y1, z]]);
+    }
+    fr.push([[-W / 2, y0, z1], [W / 2, y0, z1]], [[-W / 2, y1, z1], [W / 2, y1, z1]], [[-W / 2, y0, z0], [W / 2, y0, z0]]);
+    for (let x = -1.0; x <= 1.01; x += 0.5) fr.push([[x, y0, z1], [x, y1, z1]], [[x, y0, z0], [x, y0, z1]]);
+    for (const pts of fr) k.add(MAT.paint, G.rail(pts, 0.016));
+    for (const sx of [1, -1]) for (const y of [y0 + 0.12, y1 - 0.15]) k.add(MAT.paint, G.rbox(0.08, 0.06, 0.24, 0.01), T([sx * 1.15, y, -2.66]));   // brackets
+    k.add(MAT.mesh, meshPanel(L, y1 - y0), T([W / 2, (y0 + y1) / 2, zc], [0, Math.PI / 2, 0]));
+    k.add(MAT.mesh, meshPanel(L, y1 - y0), T([-W / 2, (y0 + y1) / 2, zc], [0, Math.PI / 2, 0]));
+    k.add(MAT.mesh, meshPanel(W, y1 - y0), T([0, (y0 + y1) / 2, z1]));
+    k.add(MAT.mesh, meshPanel(W, L), T([0, y0, zc], [-Math.PI / 2, 0, 0]));
+
+    // contents
+    const yb = y0 + 0.01;
+    for (const [x, mat] of [[-0.25, MAT.canvas], [0.45, MAT.canvasTan]]) {         // bedrolls
+      const g = new THREE.CapsuleGeometry(0.14, 0.5, 6, 20).rotateZ(Math.PI / 2).scale(1, 1, 0.9);
+      k.add(mat, g, T([x, yb + 0.14, z1 + 0.2]));
+      for (const dx of [-0.18, 0.18]) k.add(MAT.strap, G.torus(0.143, 0.009, 6, 24).rotateY(Math.PI / 2).scale(1, 1, 0.9), T([x + dx, yb + 0.14, z1 + 0.2]));
+    }
+    for (let i = 0; i < 3; i++) {                                                // ration boxes
+      k.add(MAT.cardboard, G.rbox(0.4, 0.24, 0.3, 0.008), T([-1.05, yb + 0.12 + i * 0.245, z0 - 0.2], [0, (i - 1) * 0.06, 0]));
+      k.add(MAT.strap, G.box(0.41, 0.245, 0.012), T([-1.05, yb + 0.12 + i * 0.245, z0 - 0.2], [0, (i - 1) * 0.06, 0]));
+    }
+    {                                                                            // cooler
+      const m = T([-0.55, yb, z0 - 0.22], [0, 0.04, 0]);
+      k.add(MAT.cooler, G.rbox(0.62, 0.34, 0.38, 0.04), mul(m, T([0, 0.17, 0])));
+      k.add(MAT.cooler, G.rbox(0.64, 0.06, 0.4, 0.03), mul(m, T([0, 0.36, 0])));
+      for (const sx of [1, -1]) k.add(MAT.black, G.rail([[sx * 0.31, 0.26, -0.07], [sx * 0.34, 0.26, -0.07], [sx * 0.34, 0.26, 0.07], [sx * 0.31, 0.26, 0.07]], 0.01));
+      for (const sx of [1, -1]) k.add(MAT.black, G.rbox(0.05, 0.04, 0.02, 0.006), mul(m, T([sx * 0.2, 0.33, 0.2])));
+    }
+    for (let i = 0; i < 3; i++) jerryCanKit(k, T([0.25 + i * 0.2, yb, z0 - 0.2], [0, Math.PI / 2 + (i - 1) * 0.04, 0]));   // water cans
+    k.add(MAT.camNet, lumpyRoll(0.17, 1.3, 1), T([0.62, y1 - 0.1, z1 + 0.22], [0, 0.03, 0]));                            // cam nets
+    k.add(MAT.camNet, lumpyRoll(0.15, 1.0, 4), T([-0.45, y1 - 0.06, z0 - 0.3], [0, -0.05, 0]));
+    for (const dx of [0.3, 0.95, -0.2, -0.75]) for (const x of [dx])                                                      // cargo straps
+      k.add(MAT.strap, G.tube([[x, y0 + 0.05, z0 + 0.02], [x, y1 + 0.02, z0 - 0.08], [x, y1 + 0.1, zc], [x, y1 + 0.03, z1 + 0.05], [x, y0 + 0.05, z1 - 0.02]], 0.012, 24, 4).scale(1, 1, 1));
+    for (const x of [0.3, 0.95, -0.2, -0.75]) k.add(MAT.steel, G.rbox(0.05, 0.02, 0.06, 0.006), T([x, y1 + 0.09, zc + 0.05], [0.1, 0, 0]));
+  }
+
+  // --- whip antenna bases, crosswind sensor mast ---
+  for (const sx of [1, -1]) {
+    k.add(MAT.paint, G.rbox(0.14, 0.08, 0.14, 0.015), T([sx * 1.12, R + 0.04, -2.3]));
+    k.add(MAT.black, G.lathe([[0.03, 0], [0.034, 0.02], [0.03, 0.04], [0.034, 0.06], [0.03, 0.08], [0.034, 0.1], [0.03, 0.12], [0.02, 0.13]], 16), T([sx * 1.12, R + 0.08, -2.3]));
+  }
+  k.add(MAT.paint, G.rbox(0.14, 0.05, 0.14, 0.012), T([0, R + 0.025, -1.92]));
+  k.add(MAT.paint, G.cyl(0.022, 0.028, 0.6, 12), T([0, R + 0.33, -1.92]));
+  k.add(MAT.darkSteel, G.cyl(0.05, 0.05, 0.1, 18), T([0, R + 0.68, -1.92]));
+  k.add(MAT.darkSteel, G.cyl(0.054, 0.054, 0.012, 18), T([0, R + 0.74, -1.92]));
+  for (let i = 0; i < 3; i++) { const a = i / 3 * Math.PI * 2; k.add(MAT.darkSteel, G.cyl(0.005, 0.005, 0.16, 6), T([Math.cos(a) * 0.062, R + 0.69, -1.92 + Math.sin(a) * 0.062])); }
+
+  // --- commander's station ring with vision blocks, loader's skate ring ---
+  const cmdr = [-0.72, -0.55], ldr = [0.75, -0.45];
+  k.add(MAT.paint, G.cyl(0.42, 0.45, 0.14, 40), T([cmdr[0], R + 0.07, cmdr[1]]));
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 1.6 - Math.PI * 0.3;
+    const m = T([cmdr[0] + Math.sin(a) * 0.43, R + 0.1, cmdr[1] + Math.cos(a) * 0.43], [0, a, 0]);
+    k.add(MAT.paint, G.rbox(0.14, 0.09, 0.07, 0.012), m);
+    k.add(MAT.glass, G.box(0.1, 0.05, 0.008), mul(m, T([0, 0.005, 0.036])));
+  }
+  k.add(MAT.paint, G.cyl(0.36, 0.38, 0.05, 36), T([ldr[0], R + 0.025, ldr[1]]));
+  k.add(MAT.paint, G.torus(0.5, 0.022, 8, 48).rotateX(Math.PI / 2), T([ldr[0], R + 0.12, ldr[1]]));
+  for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; k.add(MAT.paint, G.rbox(0.04, 0.1, 0.04, 0.008), T([ldr[0] + Math.cos(a) * 0.5, R + 0.06, ldr[1] + Math.sin(a) * 0.5])); }
+
+  // CITV pedestal
+  const citvPos = [0.52, 0.98];
+  k.add(MAT.paint, G.cyl(0.16, 0.2, 0.06, 28), T([citvPos[0], R + 0.03, citvPos[1]]));
+  k.add(MAT.paint, G.cyl(0.13, 0.14, 0.26, 28), T([citvPos[0], R + 0.17, citvPos[1]]));
+
+  root.add(k.build('turretBody'));
+
+  // --- hatches (pivot groups) ---
+  const ch = hatchKit(0.33).build('cmdrHatch'); const chp = new THREE.Group();
+  chp.position.set(cmdr[0] + 0.33, R + 0.14, cmdr[1]); chp.rotation.y = Math.PI; chp.add(ch); root.add(chp); PARTS.cmdrHatch = chp;
+  const lh = hatchKit(0.32).build('loaderHatch'); const lhp = new THREE.Group();
+  lhp.position.set(ldr[0] - 0.32, R + 0.05, ldr[1]); lhp.add(lh); root.add(lhp); PARTS.loaderHatch = lhp;
+
+  // --- CITV head (scans on its own) ---
+  {
+    const h = new Kit();
+    h.add(MAT.paint, G.rbox(0.34, 0.3, 0.38, 0.03), T([0, 0.15, 0]));
+    h.add(MAT.paint, G.rbox(0.38, 0.04, 0.42, 0.015), T([0, 0.31, 0.01]));
+    h.add(MAT.glass, G.box(0.22, 0.15, 0.01), T([0, 0.15, 0.192]));
+    for (const sx of [1, -1]) {
+      h.add(MAT.paint, G.rbox(0.12, 0.2, 0.025, 0.008), T([sx * 0.2, 0.15, 0.2], [0, sx * 0.9, 0]));
+      h.add(MAT.darkSteel, G.cyl(0.012, 0.012, 0.2, 8), T([sx * 0.16, 0.15, 0.19]));
+    }
+    h.add(MAT.paint, G.rbox(0.3, 0.06, 0.04, 0.01), T([0, 0.24, 0.21]));
+    const head = h.build('citvHead'); head.position.set(citvPos[0], R + 0.3, citvPos[1]);
+    root.add(head); PARTS.citv = head;
+    let target = 0, hold = 0;
+    onFrame((dt) => {
+      hold -= dt;
+      if (hold <= 0) { target = (Math.random() * 2 - 1) * 1.9; hold = 2.5 + Math.random() * 3.5; }
+      head.rotation.y += (target - head.rotation.y) * Math.min(1, dt * 1.2);
+    });
+  }
+
+  // --- commander's remote weapon station (low profile, .50 cal + sight) ---
+  {
+    const rws = new THREE.Group(); rws.name = 'rws'; rws.position.set(cmdr[0] - 0.08, R + 0.14, cmdr[1] + 0.62);
+    const b = new Kit();
+    b.add(MAT.paint, G.cyl(0.26, 0.28, 0.08, 32), T([0, 0.04, 0]));
+    b.add(MAT.paint, G.rbox(0.5, 0.08, 0.42, 0.02), T([0, 0.12, -0.02]));
+    for (const sx of [1, -1]) b.add(MAT.paint, G.rbox(0.05, 0.3, 0.3, 0.015), T([sx * 0.2, 0.28, 0]));
+    // sight unit with day camera, thermal and laser windows
+    b.add(MAT.paint, G.rbox(0.2, 0.24, 0.32, 0.02), T([-0.36, 0.3, 0.04]));
+    b.add(MAT.paint, G.rbox(0.22, 0.03, 0.36, 0.01), T([-0.36, 0.435, 0.06]));
+    for (const [y, r] of [[0.36, 0.045], [0.25, 0.035]]) { b.add(MAT.darkSteel, G.cylZ(r + 0.01, 0.03, 18), T([-0.36, y, 0.2])); b.add(MAT.glass, G.cylZ(r, 0.01, 18), T([-0.36, y, 0.216])); }
+    b.add(MAT.glass, G.box(0.05, 0.03, 0.01), T([-0.31, 0.3, 0.205]));
+    b.add(MAT.darkSteel, G.rbox(0.05, 0.08, 0.05, 0.01), T([-0.26, 0.42, -0.08]));
+    const base = b.build('rwsBase'); rws.add(base);
+    const cr = new THREE.Group(); cr.position.set(0, 0.3, 0); rws.add(cr); PARTS.rwsCradle = cr;
+    const c = new Kit();
+    c.add(MAT.darkSteel, G.rbox(0.13, 0.15, 0.5, 0.015), T([0, 0, 0]));                 // receiver
+    c.add(MAT.darkSteel, G.cylX(0.03, 0.36, 12), T([0, 0, 0]));                           // trunnion
+    c.add(MAT.darkSteel, G.cylZ(0.032, 0.26, 16), T([0, 0, 0.37]));                       // barrel support
+    c.add(MAT.darkSteel, G.cylZ(0.022, 1.05, 14), T([0, 0, 0.95]));                      // barrel
+    c.add(MAT.darkSteel, G.cylZ(0.03, 0.09, 14, 0.026), T([0, 0, 1.5]));                 // flash hider
+    c.add(MAT.darkSteel, G.rbox(0.03, 0.03, 0.18, 0.008), T([0, 0.06, 0.4]));             // carry handle
+    c.add(MAT.paint, G.rbox(0.14, 0.2, 0.3, 0.015), T([0.15, -0.02, -0.02]));              // ammo can
+    c.add(MAT.darkSteel, G.rbox(0.05, 0.04, 0.12, 0.008), T([0.07, 0.04, 0.05]));          // feed chute
+    cr.add(c.build('rwsGun'));
+    root.add(rws); PARTS.rws = rws;
+  }
+
+  // --- loader's M240 on skate mount ---
+  {
+    const g = new THREE.Group(); g.name = 'loaderMG'; g.position.set(ldr[0], R + 0.12, ldr[1]); g.rotation.y = 0.35;
+    const m = new Kit();
+    m.add(MAT.paint, G.rbox(0.12, 0.07, 0.12, 0.015), T([0, 0.03, 0.5]));                 // skate carriage
+    m.add(MAT.darkSteel, G.cyl(0.025, 0.025, 0.32, 12), T([0, 0.22, 0.5]));               // pintle post
+    m.add(MAT.darkSteel, G.rbox(0.06, 0.05, 0.08, 0.01), T([0, 0.38, 0.5]));              // cradle
+    const gm = T([0, 0.44, 0.5]);
+    m.add(MAT.black, G.rbox(0.07, 0.11, 0.3, 0.012), mul(gm, T([0, 0, 0.02])));           // receiver
+    m.add(MAT.black, G.rbox(0.072, 0.025, 0.2, 0.008), mul(gm, T([0, 0.065, 0.02])));      // feed cover
+    m.add(MAT.black, G.cylZ(0.012, 0.56, 12), mul(gm, T([0, 0.015, 0.45])));              // barrel
+    m.add(MAT.black, G.cylZ(0.019, 0.08, 12), mul(gm, T([0, 0.015, 0.75])));              // flash hider
+    m.add(MAT.black, G.cylZ(0.01, 0.4, 8), mul(gm, T([0, -0.02, 0.33])));                 // gas tube
+    m.add(MAT.black, G.rbox(0.05, 0.1, 0.26, 0.015), mul(gm, T([0, -0.02, -0.25]), T([0, 0, 0], [0.12, 0, 0])));   // stock
+    m.add(MAT.black, G.rbox(0.03, 0.09, 0.04, 0.008), mul(gm, T([0, -0.09, -0.06], [0.3, 0, 0])));              // grip
+    m.add(MAT.black, G.rail([[0, 0.06, 0.35], [0, 0.12, 0.38], [0, 0.12, 0.48], [0, 0.04, 0.5]].map(p => [p[0], p[1] + 0.44, p[2] + 0.5]), 0.008));  // handle
+    for (const sx of [1, -1]) m.add(MAT.black, G.cylZ(0.006, 0.28, 6), mul(gm, T([sx * 0.02, -0.02, 0.5])));   // folded bipod
+    m.add(MAT.paint, G.rbox(0.1, 0.16, 0.24, 0.012), mul(gm, T([0.1, -0.03, 0.04])));     // ammo box
+    g.add(m.build('m240')); root.add(g); PARTS.loaderMG = g;
+  }
+
+  // --- whip antennas (swaying) ---
+  PARTS.whips = [];
+  for (const sx of [1, -1]) {
+    const geo = new THREE.CylinderGeometry(0.0025, 0.007, 2.9, 6, 30).translate(0, 1.45, 0);
+    const p = geo.attributes.position;
+    for (let i = 0; i < p.count; i++) { const y = p.getY(i); p.setZ(i, p.getZ(i) - 0.035 * y * y); }
+    geo.computeVertexNormals();
+    const w = new THREE.Mesh(geo, MAT.black); w.castShadow = true;
+    const pv = new THREE.Group(); pv.position.set(sx * 1.12, R + 0.2, -2.3); pv.add(w); root.add(pv);
+    PARTS.whips.push(pv);
+  }
+  onFrame((dt, t) => PARTS.whips.forEach((w, i) => {
+    w.rotation.x = 0.03 * Math.sin(t * 1.6 + i) + 0.015 * Math.sin(t * 3.7 + i * 2);
+    w.rotation.z = 0.02 * Math.sin(t * 1.2 + i * 3);
+  }));
+
+  // --- gun ---
+  root.add(buildGun());
+  return root;
+}
+
+/** Canvas mantlet cover: folded frustum from turret face to thermal sleeve. */
+function mantletCoverGeo() {
+  const U = 56, V = 16, pos = [], idx = [], uvs = [];
+  const z0 = 0.26, z1 = 0.72;
+  for (let j = 0; j <= V; j++) {
+    const v = j / V, z = z0 + (z1 - z0) * v;
+    for (let i = 0; i <= U; i++) {
+      const u = i / U, a = u * Math.PI * 2;
+      const rx = THREE.MathUtils.lerp(0.44, 0.135, Math.pow(v, 0.8)), ry = THREE.MathUtils.lerp(0.3, 0.135, Math.pow(v, 0.8));
+      let k = 1 + 0.06 * Math.sin(a * 9 + v * 2.5) * (1 - v) * (0.6 + 0.4 * Math.sin(a * 2)) + 0.025 * Math.sin(v * Math.PI * 6 + a) * (1 - v * 0.5);
+      if (v > 0.92) k = 1 + (k - 1) * (1 - (v - 0.92) / 0.08);
+      let y = Math.sin(a) * ry * k; const x = Math.cos(a) * rx * k;
+      if (y < 0) y *= 1 + 0.12 * (1 - v);              // slight sag underneath
+      pos.push(x, y, z); uvs.push(u * 4, v * 2);
+    }
+  }
+  for (let j = 0; j < V; j++) for (let i = 0; i < U; i++) {
+    const a = j * (U + 1) + i, b = a + U + 1;
+    idx.push(a, a + 1, b, b, a + 1, b + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+function buildGun() {
+  const pivot = new THREE.Group(); pivot.name = 'gun';
+  pivot.position.set(...TUR.trunnion);
+  const k = new Kit();
+  // thermal sleeve segments (paint), radii taper toward the muzzle
+  const segs = [[0.40, 1.15, 0.118], [1.17, 2.05, 0.114], [2.65, 3.45, 0.108], [3.47, 4.18, 0.104]];
+  for (const [a, b, r] of segs) {
+    k.add(MAT.paint, G.cylZ(r, b - a, 28, r + 0.002), T([0, 0, (a + b) / 2]));
+    k.add(MAT.paint, G.box(0.02, 0.008, b - a - 0.04), T([0, r + 0.002, (a + b) / 2]));                  // seam
+    for (const f of [0.25, 0.75]) {                                                                          // straps + buckles
+      const z = a + (b - a) * f;
+      k.add(MAT.strap, G.cylZ(r + 0.006, 0.03, 28), T([0, 0, z]));
+      k.add(MAT.steel, G.rbox(0.03, 0.02, 0.04, 0.005), T([r * 0.72, r * 0.72, z], [0, 0, -Math.PI / 4]));
+    }
+    for (const ang of [0.6, Math.PI - 0.6, -Math.PI / 2]) {                                                // latches at the joint
+      k.add(MAT.darkSteel, G.rbox(0.03, 0.018, 0.06, 0.006), T([Math.cos(ang) * (r + 0.008), Math.sin(ang) * (r + 0.008), b - 0.02], [0, 0, ang - Math.PI / 2]));
+    }
+  }
+  // bore evacuator
+  k.add(MAT.paint, G.lathe([[0.114, 0], [0.13, 0.04], [0.158, 0.12], [0.162, 0.2], [0.162, 0.42], [0.155, 0.5], [0.13, 0.57], [0.108, 0.6]], 36).rotateX(Math.PI / 2), T([0, 0, 2.05]));
+  k.add(MAT.strap, G.cylZ(0.165, 0.025, 36), T([0, 0, 2.3]));
+  // muzzle with bore
+  k.add(MAT.steel, G.lathe([[0.102, 0], [0.1, 0.1], [0.098, 0.12], [0.062, 0.12], [0.062, 0.08]], 36).rotateX(Math.PI / 2), T([0, 0, 4.18]));
+  k.add(MAT.black, G.cylZ(0.062, 0.06, 24), T([0, 0, 4.25]));
+  // muzzle reference sensor: clamp ring, bracket, emitter box looking back
+  k.add(MAT.darkSteel, G.cylZ(0.114, 0.05, 28), T([0, 0, 4.12]));
+  k.add(MAT.darkSteel, G.rbox(0.05, 0.06, 0.05, 0.008), T([0, 0.14, 4.12]));
+  k.add(MAT.darkSteel, G.rbox(0.09, 0.06, 0.11, 0.012), T([0, 0.19, 4.11]));
+  k.add(MAT.glass, G.cylZ(0.016, 0.01, 14), T([0, 0.19, 4.05]));
+  // breech-end collar under the cover + canvas cover + cover straps
+  k.add(MAT.darkSteel, G.cylZ(0.2, 0.3, 32), T([0, 0, 0.12]));
+  const cover = mantletCoverGeo();
+  k.add(MAT.canvas, cover);
+  for (const [v, r] of [[0.62, 0.2], [0.88, 0.148]]) k.add(MAT.strap, G.torus(r, 0.012, 6, 36).scale(1.12, 1, 1), T([0, 0, 0.26 + 0.46 * v]));
+  k.add(MAT.strap, G.tube([[0, 0.31, 0.27], [0, 0.26, 0.42], [0, 0.2, 0.56], [0, 0.15, 0.68]], 0.01, 16, 4));
+  pivot.add(k.build('gunTube'));
+  PARTS.gun = pivot;
+  return pivot;
+}
+
+const turret = buildTurret();
+tank.add(turret);
+PARTS.turret = turret;
 
 /* =====================================================================
    ui (minimal for now)
