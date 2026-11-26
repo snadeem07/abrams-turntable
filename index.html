@@ -444,6 +444,260 @@ const hull = buildHull();
 tank.add(hull);
 
 /* =====================================================================
+   runningGear
+   Track loop in the side (z,y) plane: circles (road wheels, idler, return
+   rollers, sprocket) traversed CCW with the track outside; straight
+   tangent segments + arcs; links placed by arc length (instanced).
+   Driving forward: track travel `dist` grows, bottom run moves -z.
+   ===================================================================== */
+const RG = {
+  x: HULL.trackX, pitch: 0.193, thick: 0.085,
+  road: { r: 0.3175, y: 0.4025, z: [-2.15, -1.45, -0.75, -0.05, 0.65, 1.35, 2.05] },
+  idler: { r: 0.30, y: 0.58, z: 3.02 },
+  sprocket: { r: 11 * 0.193 / (2 * Math.PI), y: 0.62, z: -3.10 },   // pitch radius matches 11 teeth
+  rollers: [{ z: 1.25, r: 0.11 }, { z: -0.95, r: 0.11 }],
+  dist: 0,                                  // accumulated track travel (m)
+  bump: { 1: new Array(7).fill(0), [-1]: new Array(7).fill(0) },   // per-wheel vertical offsets (suspension)
+};
+// return rollers just lift the top run slightly
+(() => {
+  const z0 = RG.idler.z, y0 = RG.idler.y + RG.idler.r, z1 = RG.sprocket.z, y1 = RG.sprocket.y + RG.sprocket.r;
+  for (const r of RG.rollers) r.y = y0 + (r.z - z0) / (z1 - z0) * (y1 - y0) + 0.014 - r.r;
+})();
+
+/** Circles (u=z, v=y, r) in CCW traversal order for one side. */
+function trackCircles(side) {
+  const c = [];
+  RG.road.z.forEach((z, i) => c.push({ u: z, v: RG.road.y + RG.bump[side][i], r: RG.road.r, kind: 'road' }));
+  c.push({ u: RG.idler.z, v: RG.idler.y, r: RG.idler.r, kind: 'idler' });
+  for (const r of RG.rollers) c.push({ u: r.z, v: r.y, r: r.r, kind: 'roller' });
+  c.push({ u: RG.sprocket.z, v: RG.sprocket.y, r: RG.sprocket.r, kind: 'sprocket' });
+  return c;
+}
+/** Build the closed path: [{type:'arc'|'line', len, ...}] and total length. */
+function buildTrackPath(circles) {
+  const n = circles.length, tang = [];
+  for (let i = 0; i < n; i++) {
+    const a = circles[i], b = circles[(i + 1) % n];
+    const du = b.u - a.u, dv = b.v - a.v, L = Math.hypot(du, dv), hu = du / L, hv = dv / L;
+    const c1 = (a.r - b.r) / L, c2 = Math.sqrt(Math.max(0, 1 - c1 * c1));
+    const nu = c1 * hu + c2 * hv, nv = c1 * hv - c2 * hu;         // c1*D + c2*perpRight(D)
+    tang.push({ nu, nv, pa: [a.u + a.r * nu, a.v + a.r * nv], pb: [b.u + b.r * nu, b.v + b.r * nv] });
+  }
+  const segs = []; let total = 0;
+  for (let i = 0; i < n; i++) {
+    const c = circles[i], tin = tang[(i - 1 + n) % n], tout = tang[i];
+    const a0 = Math.atan2(tin.nv, tin.nu), a1 = Math.atan2(tout.nv, tout.nu);
+    let sweep = ((a1 - a0) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+    if (sweep > 2 * Math.PI - 1e-4) sweep = 0;
+    if (sweep > 1e-6) { segs.push({ type: 'arc', c, a0, sweep, len: sweep * c.r, s0: total }); total += sweep * c.r; }
+    const [u0, v0] = tout.pa, [u1, v1] = tout.pb, len = Math.hypot(u1 - u0, v1 - v0);
+    const top = tout.nv > 0.5;
+    segs.push({ type: 'line', u0, v0, tu: (u1 - u0) / len, tv: (v1 - v0) / len, nu: tout.nu, nv: tout.nv, len, s0: total,
+      sag: top ? Math.min(0.035, len * 0.012) : 0 });
+    total += len;
+  }
+  return { segs, total };
+}
+/** Sample path at arc length s -> position (u,v), tangent (tu,tv), outward normal (nu,nv). */
+function samplePath(path, s, out) {
+  s = ((s % path.total) + path.total) % path.total;
+  let seg = path.segs[path.segs.length - 1];
+  for (const g of path.segs) { if (s < g.s0 + g.len) { seg = g; break; } }
+  const d = s - seg.s0;
+  if (seg.type === 'arc') {
+    const a = seg.a0 + d / seg.c.r, ca = Math.cos(a), sa = Math.sin(a);
+    out.u = seg.c.u + seg.c.r * ca; out.v = seg.c.v + seg.c.r * sa;
+    out.tu = -sa; out.tv = ca; out.nu = ca; out.nv = sa;
+  } else {
+    const t = d / seg.len, sag = seg.sag * 4 * t * (1 - t), dsag = seg.sag * 4 * (1 - 2 * t) / seg.len;
+    out.u = seg.u0 + seg.tu * d - seg.nu * sag; out.v = seg.v0 + seg.tv * d - seg.nv * sag;
+    let tu = seg.tu - seg.nu * dsag, tv = seg.tv - seg.nv * dsag; const l = Math.hypot(tu, tv); tu /= l; tv /= l;
+    out.tu = tu; out.tv = tv; out.nu = tv; out.nv = -tu;
+  }
+  return out;
+}
+
+// --- component geometry (axis = +X, outward face at +X) --------------
+const latheX = (pts, seg = 40) => G.lathe(pts, seg).rotateZ(-Math.PI / 2);
+function roadWheelKit(r, rubber = true) {
+  const k = new Kit();
+  for (const side of [1, -1]) {
+    const x = side * 0.135;
+    if (rubber) k.add(MAT.rubber, latheX([[r - 0.055, -0.094], [r - 0.016, -0.094], [r - 0.004, -0.084], [r, -0.06], [r, 0.06], [r - 0.004, 0.084], [r - 0.016, 0.094], [r - 0.055, 0.094], [r - 0.055, -0.094]], 48), T([x, 0, 0]));
+    else k.add(MAT.steel, latheX([[r - 0.05, -0.094], [r - 0.006, -0.094], [r, -0.08], [r, 0.08], [r - 0.006, 0.094], [r - 0.05, 0.094], [r - 0.05, -0.094]], 48), T([x, 0, 0]));
+    const rr = r - 0.055;
+    k.add(MAT.paint, latheX([[0.03, 0.075], [0.09, 0.075], [0.105, 0.05], [rr - 0.06, 0.03], [rr - 0.01, 0.065], [rr + 0.002, 0.094], [rr + 0.002, -0.094], [rr - 0.01, -0.065], [rr - 0.06, -0.03], [0.105, -0.05], [0.09, -0.075], [0.03, -0.075], [0.03, 0.075]], 40), T([x, 0, 0]));
+  }
+  // hub cap with bolts on the outer face
+  k.add(MAT.paint, G.cylX(0.085, 0.05, 28, 0.095), T([0.235 + 0.02, 0, 0]));
+  k.add(MAT.steel, G.cylX(0.045, 0.03, 20), T([0.235 + 0.055, 0, 0]));
+  k.add(MAT.steel, G.sphere(0.03, 12, 8).scale(0.6, 1, 1), T([0.235 + 0.07, 0, 0]));
+  for (let i = 0; i < 8; i++) {
+    const a = i / 8 * Math.PI * 2;
+    k.add(MAT.steel, G.hexBolt(0.011, 0.012), T([0.235 + 0.045, Math.cos(a) * 0.066, Math.sin(a) * 0.066], [0, 0, -Math.PI / 2]));
+  }
+  for (let i = 0; i < 10; i++) {
+    const a = (i + 0.5) / 10 * Math.PI * 2;
+    k.add(MAT.paint, G.hexBolt(0.009, 0.008), T([0.135 + 0.072, Math.cos(a) * 0.14, Math.sin(a) * 0.14], [0, 0, -Math.PI / 2]));
+  }
+  k.add(MAT.darkSteel, G.cylX(0.06, 0.3, 16), T([-0.05, 0, 0]));     // axle spindle between discs
+  return k;
+}
+function sprocketKit() {
+  const k = new Kit(), N = 11, R = RG.sprocket.r, rt = R + 0.03, rr = R - 0.035;
+  const sh = new THREE.Shape();
+  for (let i = 0; i < N; i++) {
+    const a = i / N * Math.PI * 2, w = Math.PI / N;
+    const p = (ang, r) => [Math.cos(ang) * r, Math.sin(ang) * r];
+    const pts = [p(a - w * 0.5, rr), p(a - w * 0.28, rt - 0.012), p(a - w * 0.12, rt), p(a + w * 0.12, rt), p(a + w * 0.28, rt - 0.012), p(a + w * 0.5, rr)];
+    pts.forEach(([x, y], j) => (i === 0 && j === 0) ? sh.moveTo(x, y) : sh.lineTo(x, y));
+    const b = a + w * 0.5, e = a + w * 1.5; sh.absarc(0, 0, rr, b, e, false);
+  }
+  const hole = new THREE.Path(); hole.absarc(0, 0, 0.2, 0, Math.PI * 2, true); sh.holes.push(hole);
+  const ring = new THREE.ExtrudeGeometry(sh, { depth: 0.018, bevelEnabled: true, bevelThickness: 0.003, bevelSize: 0.004, bevelSegments: 1, curveSegments: 4 });
+  ring.translate(0, 0, -0.009).rotateY(Math.PI / 2);
+  for (const x of [0.296, -0.296]) k.add(MAT.darkSteel, ring, T([x, 0, 0]));
+  k.add(MAT.paint, latheX([[0.05, 0.3], [0.2, 0.3], [0.25, 0.26], [0.25, -0.26], [0.2, -0.3], [0.05, -0.3]], 40));
+  k.add(MAT.paint, G.cylX(0.14, 0.08, 28, 0.17), T([0.33, 0, 0]));
+  k.add(MAT.steel, G.cylX(0.07, 0.04, 20), T([0.385, 0, 0]));
+  for (let i = 0; i < 12; i++) {
+    const a = i / 12 * Math.PI * 2;
+    k.add(MAT.steel, G.hexBolt(0.012, 0.012), T([0.37, Math.cos(a) * 0.11, Math.sin(a) * 0.11], [0, 0, -Math.PI / 2]));
+    k.add(MAT.paint, G.hexBolt(0.01, 0.01), T([0.3, Math.cos(a + 0.26) * 0.225, Math.sin(a + 0.26) * 0.225], [0, 0, -Math.PI / 2]));
+  }
+  return k;
+}
+function rollerKit(r) {
+  const k = new Kit();
+  for (const x of [0.1, -0.1]) {
+    k.add(MAT.rubber, latheX([[r - 0.03, -0.055], [r - 0.006, -0.055], [r, -0.045], [r, 0.045], [r - 0.006, 0.055], [r - 0.03, 0.055], [r - 0.03, -0.055]], 32), T([x, 0, 0]));
+    k.add(MAT.paint, latheX([[0.02, 0.05], [r - 0.03, 0.035], [r - 0.03, -0.035], [0.02, -0.05]], 28), T([x, 0, 0]));
+  }
+  k.add(MAT.steel, G.cylX(0.04, 0.05, 16), T([0.17, 0, 0]));
+  for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; k.add(MAT.steel, G.hexBolt(0.007, 0.007), T([0.195, Math.cos(a) * 0.026, Math.sin(a) * 0.026], [0, 0, -Math.PI / 2])); }
+  return k;
+}
+/** One track link. Local: x lateral, y inward (toward wheels, inner face at y=0), z along travel. */
+function trackLinkKits() {
+  const st = new Kit(), rb = new Kit(), P = RG.pitch;
+  for (const sx of [1, -1]) {
+    st.add(MAT.steel, G.rbox(0.252, 0.042, 0.172, 0.012), T([sx * 0.155, -0.021, 0]));
+    // rubber bushing bosses + split rubber pads
+    st.add(MAT.steel, G.cylX(0.022, 0.25, 10), T([sx * 0.155, -0.02, P * 0.33]));
+    st.add(MAT.steel, G.cylX(0.022, 0.25, 10), T([sx * 0.155, -0.02, -P * 0.33]));
+    rb.add(MAT.rubber, G.rbox(0.232, 0.043, 0.162, 0.012), T([sx * 0.155, -0.062, 0]));
+    rb.add(MAT.rubber, G.box(0.012, 0.012, 0.14), T([sx * 0.155, -0.084, 0]));   // centre tread ridge   // centre groove ridge
+    // end connector + wedge + wedge bolt at the joint
+    st.add(MAT.steel, G.rbox(0.048, 0.07, 0.1, 0.01), T([sx * 0.336, -0.018, P / 2]));
+    st.add(MAT.steel, G.box(0.03, 0.03, 0.06), T([sx * 0.336, 0.028, P / 2], [0.3, 0, 0]));
+    st.add(MAT.steel, G.hexBolt(0.013, 0.014), T([sx * 0.336, 0.04, P / 2]));
+    st.add(MAT.steel, G.hexBolt(0.011, 0.01), T([sx * 0.36, -0.018, P / 2], [0, 0, -sx * Math.PI / 2]));
+  }
+  // centre guide connector with guide horn
+  st.add(MAT.steel, G.rbox(0.09, 0.045, 0.11, 0.01), T([0, -0.02, P / 2]));
+  st.add(MAT.steel, G.rbox(0.05, 0.1, 0.075, 0.012), T([0, 0.05, P / 2]));
+  st.add(MAT.steel, G.hexBolt(0.01, 0.01), T([0.045, -0.02, P / 2], [0, 0, -Math.PI / 2]));
+  return { steel: st.geometries().get(MAT.steel), rubber: rb.geometries().get(MAT.rubber) };
+}
+
+function instancedFromKit(kit, count, name) {
+  const grp = new THREE.Group(); grp.name = name; const meshes = [];
+  for (const [mat, geo] of kit.geometries()) {
+    const m = new THREE.InstancedMesh(geo, mat, count);
+    m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false;
+    grp.add(m); meshes.push(m);
+  }
+  return { grp, meshes, set(i, mtx) { for (const m of meshes) m.setMatrixAt(i, mtx); }, commit() { for (const m of meshes) m.instanceMatrix.needsUpdate = true; } };
+}
+
+function buildRunningGear() {
+  const root = new THREE.Group(); root.name = 'runningGear';
+  const road = instancedFromKit(roadWheelKit(RG.road.r), 14, 'roadWheels');
+  const idler = instancedFromKit(roadWheelKit(RG.idler.r, false), 2, 'idlers');
+  const spr = instancedFromKit(sprocketKit(), 2, 'sprockets');
+  const rol = instancedFromKit(rollerKit(RG.rollers[0].r), 4, 'rollers');
+  root.add(road.grp, idler.grp, spr.grp, rol.grp);
+
+  // static mounts: idler bracket, final drive housing, roller stub axles, hub mounts
+  const k = new Kit();
+  for (const sx of [1, -1]) {
+    k.add(MAT.paint, G.rbox(0.16, 0.22, 0.42, 0.02), T([sx * 1.12, RG.idler.y + 0.08, RG.idler.z - 0.12], [0.35, 0, 0]));
+    k.add(MAT.paint, G.cylX(0.17, 0.3, 28, 0.2), T([sx * 1.05, RG.sprocket.y, RG.sprocket.z]));
+    for (const r of RG.rollers) {
+      k.add(MAT.paint, G.cylX(0.035, 0.26, 12), T([sx * 1.25, r.y, r.z]));
+      k.add(MAT.paint, G.rbox(0.05, 0.16, 0.14, 0.015), T([sx * 1.13, r.y + 0.06, r.z]));
+    }
+    RG.road.z.forEach((z, i) => {
+      if (i === 0 || i === 1 || i === 6) {   // shock absorbers on stations 1, 2, 7
+        k.add(MAT.darkSteel, G.cyl(0.045, 0.045, 0.32, 14), T([sx * 1.16, 0.74, z + 0.2], [0.5, 0, 0]));
+        k.add(MAT.steel, G.cyl(0.025, 0.025, 0.2, 10), T([sx * 1.16, 0.62, z + 0.28], [0.5, 0, 0]));
+      }
+      k.add(MAT.paint, G.cylX(0.075, 0.08, 20), T([sx * 1.135, 0.56, z + 0.38]));   // torsion bar anchor
+    });
+  }
+  root.add(k.build('rgMounts'));
+
+  // road arms (instanced, follow suspension)
+  const armGeo = prep(G.rbox(0.09, 0.11, 0.42, 0.025));
+  const arms = new THREE.InstancedMesh(armGeo, MAT.paint, 14);
+  arms.castShadow = arms.receiveShadow = true; arms.frustumCulled = false;
+  root.add(arms);
+
+  // track links
+  const links = trackLinkKits();
+  const path0 = buildTrackPath(trackCircles(1));
+  const N = Math.round(path0.total / RG.pitch);
+  const trSteel = new THREE.InstancedMesh(links.steel, MAT.steel, N * 2);
+  const trRub = new THREE.InstancedMesh(links.rubber, MAT.rubber, N * 2);
+  for (const m of [trSteel, trRub]) { m.castShadow = m.receiveShadow = true; m.frustumCulled = false; root.add(m); }
+  RG.links = N;
+
+  const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), Pv = new THREE.Vector3(), Sv = new THREE.Vector3(1, 1, 1);
+  const X = new THREE.Vector3(1, 0, 0), Yv = new THREE.Vector3(), Zv = new THREE.Vector3(), smp = {};
+  const ry = (side) => side > 0 ? 0 : Math.PI;
+  const wheelM = (x, y, z, side, ang) => T([x, y, z], [side * ang, ry(side), 0, 'YXZ']);
+
+  function update() {
+    const d = RG.dist;
+    let ri = 0, ro = 0;
+    for (const side of [1, -1]) {
+      const x = side * RG.x, base = side > 0 ? 0 : N;
+      const circles = trackCircles(side), path = buildTrackPath(circles), step = path.total / N;
+      for (let i = 0; i < N; i++) {
+        samplePath(path, i * step - d, smp);
+        Yv.set(0, -smp.nv, -smp.nu); Zv.set(0, smp.tv, smp.tu);
+        M.makeBasis(X, Yv, Zv).setPosition(x, smp.v, smp.u);
+        trSteel.setMatrixAt(base + i, M); trRub.setMatrixAt(base + i, M);
+      }
+      circles.forEach((c, i) => {
+        if (c.kind === 'road') {
+          road.set(ri, wheelM(x, c.v, c.u, side, d / c.r));
+          // arm from torsion anchor (z+0.38, y 0.56) to hub
+          const ax = side * 1.19, ay = 0.56, az = c.u + 0.38, dy = c.v - ay, dz = c.u - az, len = Math.hypot(dy, dz);
+          M.compose(Pv.set(ax, (ay + c.v) / 2, (az + c.u) / 2), Q.setFromEuler(_e.set(-Math.atan2(dy, dz), 0, 0)), Sv.set(1, 1, len / 0.42));
+          arms.setMatrixAt(ri, M);
+          ri++;
+        } else if (c.kind === 'idler') idler.set(side > 0 ? 0 : 1, wheelM(x, c.v, c.u, side, d / c.r));
+        else if (c.kind === 'sprocket') spr.set(side > 0 ? 0 : 1, wheelM(x, c.v, c.u, side, d / c.r));
+        else if (c.kind === 'roller') rol.set(ro++, wheelM(x, c.v, c.u, side, d / c.r));
+      });
+    }
+    trSteel.instanceMatrix.needsUpdate = trRub.instanceMatrix.needsUpdate = arms.instanceMatrix.needsUpdate = true;
+    road.commit(); idler.commit(); spr.commit(); rol.commit();
+  }
+  update();
+  return { root, update };
+}
+const runningGear = buildRunningGear();
+tank.add(runningGear.root);
+let lastTrackDist = NaN;
+onFrame((dt) => {
+  RG.dist += (RG.speed || 0) * dt;
+  if (RG.dist !== lastTrackDist || RG.dirty) { runningGear.update(); lastTrackDist = RG.dist; RG.dirty = false; }
+});
+
+/* =====================================================================
    ui (minimal for now)
    ===================================================================== */
 document.getElementById('optSpin').addEventListener('change', e => { controls.autoRotate = e.target.checked; });
@@ -475,7 +729,7 @@ function frame() {
 }
 renderer.setAnimationLoop(frame);
 
-window.APP = { THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
+window.APP = { RG, THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
 </script>
 </body>
 </html>
