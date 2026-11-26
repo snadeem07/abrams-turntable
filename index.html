@@ -187,8 +187,18 @@ class Kit {
 /* =====================================================================
    materials (base set; weathering shader is injected in Milestone 6)
    ===================================================================== */
+const std = (color, roughness, metalness = 0, extra = {}) =>
+  new THREE.MeshStandardMaterial({ color, roughness, metalness, ...extra });
 const MAT = {
-  paint: new THREE.MeshStandardMaterial({ color: 0x4d5236, roughness: 0.66, metalness: 0.0, name: 'paint' }),
+  paint:     std(0x4d5236, 0.66, 0.0, { name: 'paint' }),       // CARC Green 383
+  steel:     std(0x6b6a64, 0.42, 0.85, { name: 'steel' }),
+  darkSteel: std(0x262624, 0.55, 0.6, { name: 'darkSteel' }),
+  black:     std(0x0c0c0b, 0.75, 0.0, { name: 'black' }),
+  rubber:    std(0x141413, 0.92, 0.0, { name: 'rubber' }),
+  glass:     std(0x0b1619, 0.06, 0.2, { name: 'glass' }),
+  headlamp:  std(0xd8d4c8, 0.12, 0.1, { name: 'headlamp', emissive: 0x000000 }),
+  lensRed:   std(0x7a0d08, 0.2, 0.0, { name: 'lensRed', emissive: 0x2a0302 }),
+  lensAmber: std(0xa8650f, 0.2, 0.0, { name: 'lensAmber', emissive: 0x000000 }),
 };
 
 /* =====================================================================
@@ -221,9 +231,217 @@ scene.add(ground);
    ===================================================================== */
 const tank = new THREE.Group(); tank.name = 'tank';
 scene.add(tank);
-const proxy = new THREE.Mesh(G.rbox(3.6, 1.0, 7.9, 0.05), MAT.paint);
-proxy.position.y = 0.95; proxy.castShadow = true;
-tank.add(proxy);
+
+/* =====================================================================
+   hull
+   Upper hull (full width, over tracks) + lower hull (between tracks),
+   both side profiles extruded across X with a bevel. Details placed in
+   a surface frame that follows the glacis / deck slope.
+   ===================================================================== */
+const HULL = {
+  B: 0.03, halfW: 1.70, lowHalfW: 1.10, trackX: 1.455,
+  glacis: { z0: 3.95, y0: 0.98, z1: 2.0, y1: 1.36 },
+  deckRearZ: -3.78, deckRearY: 1.38, sponsonY: 1.08,
+  turretRingZ: 0.35,
+};
+const GL_ANG = Math.atan2(HULL.glacis.y1 - HULL.glacis.y0, HULL.glacis.z0 - HULL.glacis.z1);
+const DECK_ANG = Math.atan2(HULL.deckRearY - HULL.glacis.y1, HULL.glacis.z1 - HULL.deckRearZ);
+/** Height of the hull top surface (incl. bevel) at z. */
+function hullTopY(z) {
+  const g = HULL.glacis;
+  if (z >= g.z1) return g.y0 + (g.z0 - z) / (g.z0 - g.z1) * (g.y1 - g.y0) + HULL.B;
+  return g.y1 + (g.z1 - z) / (g.z1 - HULL.deckRearZ) * (HULL.deckRearY - g.y1) + HULL.B;
+}
+/** Matrix sitting on the hull top at (x,z), local +Y = surface normal. */
+function surf(x, z) { return T([x, hullTopY(z), z], [z >= HULL.glacis.z1 ? GL_ANG : DECK_ANG, 0, 0]); }
+const mul = (a, b) => a.clone().multiply(b);
+const PARTS = {};               // named movable parts (hatches, turret, gun, ...)
+
+function towEyeGeo() {
+  const s = new THREE.Shape();
+  s.moveTo(-0.09, -0.07); s.lineTo(0.06, -0.07);
+  s.absarc(0.06, 0, 0.07, -Math.PI / 2, Math.PI / 2, false);
+  s.lineTo(-0.09, 0.07); s.lineTo(-0.09, -0.07);
+  const h = new THREE.Path(); h.absarc(0.06, 0, 0.032, 0, Math.PI * 2, true); s.holes.push(h);
+  const g = new THREE.ExtrudeGeometry(s, { depth: 0.05, bevelEnabled: true, bevelThickness: 0.006, bevelSize: 0.006, bevelSegments: 1, curveSegments: 16 });
+  g.translate(0, 0, -0.025); g.rotateY(-Math.PI / 2);   // shape x -> +z (out), extrusion -> x
+  return g;
+}
+function shackleGeo() {
+  const R = 0.052, r = 0.014;
+  const parts = [
+    G.torus(R, r, 8, 18, Math.PI).rotateZ(Math.PI).translate(0, -0.06, 0),
+    G.cyl(r, r, 0.06, 10).translate(R, -0.03, 0), G.cyl(r, r, 0.06, 10).translate(-R, -0.03, 0),
+    G.cylX(0.011, 2 * R + 0.05, 10),
+    G.cylX(0.02, 0.012, 6).translate(R + 0.025, 0, 0), G.cylX(0.02, 0.012, 6).translate(-R - 0.025, 0, 0),
+  ];
+  return mergeGeometries(parts.map(prep));
+}
+
+function buildHull() {
+  const k = new Kit();
+  const B = HULL.B;
+  // --- main bodies ---
+  const upper = [[3.45, 1.08], [3.62, 0.90], [3.95, 0.90], [3.95, 0.98], [2.0, 1.36], [-3.78, 1.38], [-3.93, 1.28], [-3.93, 1.08]];
+  k.add(MAT.paint, G.extrudeX(upper, HULL.halfW + B, B, 3));
+  const lower = [[3.95, 0.93], [3.30, 0.50], [-3.50, 0.50], [-3.90, 0.82], [-3.90, 1.09], [2.0, 1.09], [3.6, 0.96]];
+  k.add(MAT.paint, G.extrudeX(lower, HULL.lowHalfW + B, B, 3));
+  // weld seam / lip where glacis meets the nose plate
+  k.add(MAT.paint, G.cylX(0.022, 2 * HULL.halfW + 0.02, 12), T([0, 0.985 + B * 0.6, 3.955]));
+  // turret ring race + splash guard on deck
+  k.add(MAT.paint, G.cyl(1.16, 1.2, 0.05, 64), mul(surf(0, HULL.turretRingZ), T([0, 0.025, 0])));
+  k.add(MAT.darkSteel, G.cyl(1.08, 1.08, 0.07, 64), mul(surf(0, HULL.turretRingZ), T([0, 0.035, 0])));
+
+  // --- driver's hatch + periscopes (glacis, centre) ---
+  const zH = 2.62;
+  k.add(MAT.paint, G.cyl(0.33, 0.36, 0.045, 36), mul(surf(0, zH), T([0, 0.022, 0])));
+  [[-0.25, 2.93, 0.5], [0, 2.99, 0], [0.25, 2.93, -0.5]].forEach(([x, z, ry]) => {
+    const m = mul(surf(x, z), T([0, 0, 0], [0, ry, 0]));
+    k.add(MAT.paint, G.rbox(0.19, 0.11, 0.13, 0.015), mul(m, T([0, 0.055, 0])));
+    k.add(MAT.glass, G.box(0.14, 0.06, 0.012), mul(m, T([0, 0.06, 0.066], [-0.25, 0, 0])));
+    k.add(MAT.paint, G.rbox(0.21, 0.016, 0.16, 0.006), mul(m, T([0, 0.118, 0.012])));   // armoured brow
+  });
+  const hatch = new Kit();
+  hatch.add(MAT.paint, G.cyl(0.29, 0.305, 0.05, 36), T([0.3, 0.025, 0]));
+  hatch.add(MAT.paint, G.cyl(0.2, 0.24, 0.025, 36), T([0.3, 0.06, 0]));
+  hatch.add(MAT.steel, G.rail([[0.22, 0.05, -0.08], [0.22, 0.09, -0.08], [0.38, 0.09, -0.08], [0.38, 0.05, -0.08]], 0.009));
+  hatch.add(MAT.darkSteel, G.cylZ(0.035, 0.22, 16), T([0, 0.03, 0]));    // pivot boss
+  const driverHatch = hatch.build('driverHatch');
+  const hp = new THREE.Group(); hp.name = 'driverHatchPivot';
+  hp.applyMatrix4(mul(surf(-0.3, zH), T([0, 0.045, 0])));
+  hp.add(driverHatch);
+  PARTS.driverHatch = hp;
+
+  // --- headlight clusters with guards (front corners) ---
+  for (const sx of [1, -1]) {
+    const m = mul(surf(sx * 1.40, 3.58), T([0, 0, 0], [-GL_ANG, 0, 0]));
+    k.add(MAT.paint, G.rbox(0.40, 0.03, 0.22, 0.008), mul(m, T([0, 0.0, 0])));
+    k.add(MAT.paint, G.rbox(0.32, 0.15, 0.13, 0.02), mul(m, T([0, 0.095, 0])));
+    for (const [lx, r, mat] of [[-0.07, 0.05, MAT.headlamp], [0.085, 0.036, MAT.lensAmber]]) {
+      k.add(MAT.darkSteel, G.cylZ(r + 0.012, 0.04, 20), mul(m, T([sx * lx, 0.1, 0.075])));
+      k.add(mat, G.cylZ(r, 0.01, 20), mul(m, T([sx * lx, 0.1, 0.096])));
+    }
+    const gp = [[-0.2, 0.01, -0.07], [-0.2, 0.22, 0.0], [-0.18, 0.22, 0.15], [0.18, 0.22, 0.15], [0.2, 0.22, 0.0], [0.2, 0.01, -0.07]];
+    k.add(MAT.paint, G.rail(gp, 0.012), m);
+    k.add(MAT.paint, G.rail([[0, 0.22, 0.15], [0, 0.02, 0.17]], 0.011), m);
+    k.add(MAT.paint, G.rail([[-0.19, 0.02, 0.14], [0.19, 0.02, 0.14]], 0.011), m);
+  }
+
+  // --- tow eyes + shackles (front lower plate, rear plate) ---
+  const eye = towEyeGeo(), shackle = shackleGeo();
+  const fpN = new THREE.Vector2(0.43, -0.65).normalize();        // front plate outward normal (z,y)
+  for (const sx of [1, -1]) {
+    const t = 0.3, z = 3.95 - 0.65 * t + fpN.x * B, y = 0.93 - 0.43 * t + fpN.y * B;
+    k.add(MAT.paint, eye, T([sx * 0.78, y, z]));
+    k.add(MAT.steel, shackle, T([sx * 0.78, y, z + 0.06], [0.35, 0, 0]));
+    k.add(MAT.paint, eye, T([sx * 0.78, 0.95, -3.93], [0, Math.PI, 0]));
+    k.add(MAT.steel, shackle, T([sx * 0.78, 0.95, -3.99], [-0.25, 0, 0]));
+  }
+
+  // --- fuel caps ---
+  for (const [x, z] of [[1.22, 3.22], [-1.22, 3.22], [1.32, -3.48], [-1.32, -3.48]]) {
+    const m = surf(x, z);
+    k.add(MAT.paint, G.cyl(0.11, 0.118, 0.022, 28), mul(m, T([0, 0.011, 0])));
+    k.add(MAT.paint, G.cyl(0.084, 0.088, 0.036, 28), mul(m, T([0, 0.04, 0])));
+    k.add(MAT.darkSteel, G.cylX(0.012, 0.07, 10), mul(m, T([0, 0.04, -0.1])));
+    k.add(MAT.steel, G.rail([[-0.04, 0.058, 0.01], [-0.04, 0.078, 0.01], [0.04, 0.078, 0.01], [0.04, 0.058, 0.01]], 0.006), m);
+  }
+
+  // --- engine deck: access doors + grilles ---
+  for (const sx of [1, -1]) {
+    const m = surf(sx * 0.42, -1.76);
+    k.add(MAT.paint, G.rbox(0.8, 0.025, 1.04, 0.008), mul(m, T([0, 0.012, 0])));
+    for (const dz of [-0.36, 0, 0.36]) k.add(MAT.darkSteel, G.cylZ(0.016, 0.12, 10), mul(m, T([-sx * 0.38, 0.02, dz])));
+    k.add(MAT.steel, G.rail([[sx * 0.2, 0.026, 0.42], [sx * 0.2, 0.05, 0.42], [sx * 0.2, 0.05, 0.3], [sx * 0.2, 0.026, 0.3]], 0.008), m);
+    // grille
+    const gm = surf(sx * 0.76, -3.02), w = 1.3, l = 1.12;
+    k.add(MAT.black, G.box(w - 0.06, 0.01, l - 0.06), mul(gm, T([0, 0.006, 0])));
+    k.add(MAT.paint, G.rbox(0.05, 0.05, l, 0.008), mul(gm, T([w / 2 - 0.025, 0.025, 0])));
+    k.add(MAT.paint, G.rbox(0.05, 0.05, l, 0.008), mul(gm, T([-w / 2 + 0.025, 0.025, 0])));
+    k.add(MAT.paint, G.rbox(w, 0.05, 0.05, 0.008), mul(gm, T([0, 0.025, l / 2 - 0.025])));
+    k.add(MAT.paint, G.rbox(w, 0.05, 0.05, 0.008), mul(gm, T([0, 0.025, -l / 2 + 0.025])));
+    k.add(MAT.paint, G.rbox(0.035, 0.045, l - 0.05, 0.006), mul(gm, T([0, 0.024, 0])));
+    for (let z = -l / 2 + 0.07; z <= l / 2 - 0.06; z += 0.046)
+      for (const hx of [-1, 1]) k.add(MAT.paint, G.box(w / 2 - 0.07, 0.036, 0.008), mul(gm, T([hx * (w / 4 - 0.005), 0.026, z], [0.6, 0, 0])));
+    for (const [bx, bz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]])
+      k.add(MAT.paint, G.hexBolt(0.012, 0.008), mul(gm, T([bx * (w / 2 - 0.025), 0.05, bz * (l / 2 - 0.025)])));
+  }
+  // deck bolts along the rear edge
+  for (let x = -1.5; x <= 1.51; x += 0.25) k.add(MAT.paint, G.hexBolt(0.013, 0.009), surf(x, -3.7));
+
+  // --- rear exhaust grille ---
+  {
+    const zr = -3.93, w = 1.36, h = 0.44, yc = 1.07;
+    k.add(MAT.black, G.box(w - 0.06, h - 0.06, 0.02), T([0, yc, zr - 0.01]));
+    for (const sy of [1, -1]) k.add(MAT.paint, G.rbox(w, 0.05, 0.11, 0.01), T([0, yc + sy * (h / 2 - 0.025), zr - 0.055]));
+    for (const sx of [1, -1]) k.add(MAT.paint, G.rbox(0.05, h, 0.11, 0.01), T([sx * (w / 2 - 0.025), yc, zr - 0.055]));
+    k.add(MAT.paint, G.rbox(0.04, h - 0.05, 0.1, 0.008), T([0, yc, zr - 0.05]));
+    for (let y = yc - h / 2 + 0.06; y <= yc + h / 2 - 0.05; y += 0.042)
+      for (const sx of [1, -1]) k.add(MAT.paint, G.box(w / 2 - 0.07, 0.008, 0.085), T([sx * (w / 4 - 0.008), y, zr - 0.05], [-0.55, 0, 0]));
+    for (const [bx, by] of [[-1, -1], [1, -1], [-1, 1], [1, 1]])
+      k.add(MAT.paint, G.hexBolt(0.012, 0.008), T([bx * (w / 2 - 0.025), yc + by * (h / 2 - 0.025), zr - 0.11], [-Math.PI / 2, 0, 0]));
+  }
+  // --- tail lights ---
+  for (const sx of [1, -1]) {
+    const x = sx * 1.5, y = 1.2, z = -3.96;
+    k.add(MAT.paint, G.rbox(0.22, 0.12, 0.07, 0.012), T([x, y, z - 0.035]));
+    k.add(MAT.lensRed, G.box(0.075, 0.065, 0.012), T([x - sx * 0.045, y, z - 0.072]));
+    k.add(MAT.lensAmber, G.box(0.06, 0.05, 0.012), T([x + sx * 0.055, y, z - 0.072]));
+    k.add(MAT.paint, G.rail([[x - 0.13, y - 0.07, z], [x - 0.13, y + 0.08, z - 0.11], [x + 0.13, y + 0.08, z - 0.11], [x + 0.13, y - 0.07, z]], 0.009));
+  }
+  // --- mud flaps ---
+  for (const sx of [1, -1]) {
+    k.add(MAT.paint, G.rbox(0.66, 0.04, 0.05, 0.008), T([sx * HULL.trackX, 1.06, -3.6]));
+    k.add(MAT.rubber, G.rbox(0.62, 0.52, 0.016, 0.004), T([sx * HULL.trackX, 0.8, -3.61], [0.08, 0, 0]));
+    for (let i = -2; i <= 2; i++) k.add(MAT.steel, G.hexBolt(0.009, 0.006), T([sx * HULL.trackX + i * 0.12, 1.035, -3.635], [-Math.PI / 2, 0, 0]));
+  }
+
+  // --- side skirts: framed panels, lips, handles, bolts, rubber strip ---
+  const edges = [3.62, 2.70, 1.72, 0.74, -0.30, -1.34, -2.38, -3.45];
+  const yTop = 1.33, yBot = 0.62;
+  for (const sx of [1, -1]) {
+    for (let i = 0; i < edges.length - 1; i++) {
+      const zA = edges[i] - 0.006, zB = edges[i + 1] + 0.006, heavy = i < 3;
+      const t = heavy ? 0.07 : 0.036, xc = 1.745 + t / 2, xo = xc + t / 2;
+      const poly = i === 0 ? [[zA, yTop], [zB, yTop], [zB, yBot], [zA - 0.34, yBot]] : [[zA, yTop], [zB, yTop], [zB, yBot], [zA, yBot]];
+      k.add(MAT.paint, G.extrudeX(poly, t / 2, 0.008, 2), T([sx * xc, 0, 0]));
+      const cz = poly.reduce((s, p) => s + p[0], 0) / 4, cy = poly.reduce((s, p) => s + p[1], 0) / 4;
+      for (let e = 0; e < 4; e++) {
+        const [z1, y1] = poly[e], [z2, y2] = poly[(e + 1) % 4];
+        const len = Math.hypot(z2 - z1, y2 - y1), dz = (z2 - z1) / len, dy = (y2 - y1) / len;
+        let nz = -dy, ny = dz; const mz = (z1 + z2) / 2, my = (y1 + y2) / 2;
+        if (nz * (cz - mz) + ny * (cy - my) < 0) { nz = -nz; ny = -ny; }
+        k.add(MAT.paint, G.rbox(0.014, 0.034, len - 0.06, 0.004),
+          T([sx * (xo + 0.006), my + ny * 0.028, mz + nz * 0.028], [-Math.atan2(dy, dz), 0, 0]));
+      }
+      // bolts in the corners + along top
+      const bz = [zA - 0.07, zB + 0.07, (zA + zB) / 2];
+      for (const z of bz) for (const y of [yTop - 0.07, yBot + 0.07]) {
+        if (i === 0 && y < 1 && z === zA - 0.07) continue;
+        k.add(MAT.paint, G.hexBolt(0.013, 0.009), T([sx * (xo + 0.002), y, z], [0, 0, -sx * Math.PI / 2]));
+      }
+      // lifting handle
+      const hz = (zA + zB) / 2 + (i === 0 ? -0.15 : 0), hy = yTop - 0.17, hx = sx * (xo + 0.004);
+      k.add(MAT.steel, G.rail([[hx, hy + 0.03, hz - 0.1], [hx + sx * 0.055, hy, hz - 0.1], [hx + sx * 0.055, hy, hz + 0.1], [hx, hy + 0.03, hz + 0.1]], 0.01));
+      for (const dz of [-0.1, 0.1]) k.add(MAT.paint, G.rbox(0.012, 0.05, 0.035, 0.004), T([hx, hy + 0.02, hz + dz]));
+      // hinge knuckles along top
+      for (const dz of [-0.28, 0.28]) k.add(MAT.darkSteel, G.cylZ(0.022, 0.13, 12), T([sx * 1.758, yTop + 0.012, (zA + zB) / 2 + dz]));
+      // rubber strip with clamp bar
+      const zs0 = i === 0 ? zA - 0.34 : zA, len = zs0 - zB;
+      k.add(MAT.rubber, G.rbox(0.02, 0.12, len - 0.01, 0.005), T([sx * (1.745 + 0.012), yBot - 0.045, (zs0 + zB) / 2]));
+      k.add(MAT.darkSteel, G.box(0.012, 0.03, len - 0.04), T([sx * (1.745 + 0.028), yBot - 0.005, (zs0 + zB) / 2]));
+      for (let z = zB + 0.08; z < zs0 - 0.05; z += 0.17) k.add(MAT.steel, G.hexBolt(0.008, 0.006), T([sx * (1.745 + 0.034), yBot - 0.005, z], [0, 0, -sx * Math.PI / 2]));
+    }
+    // skirt top rail tying panels to sponson
+    k.add(MAT.paint, G.rbox(0.03, 0.04, edges[0] - edges[7], 0.008), T([sx * 1.75, yTop + 0.03, (edges[0] + edges[7]) / 2]));
+  }
+
+  const grp = k.build('hull');
+  grp.add(hp);
+  return grp;
+}
+const hull = buildHull();
+tank.add(hull);
 
 /* =====================================================================
    ui (minimal for now)
@@ -257,7 +475,7 @@ function frame() {
 }
 renderer.setAnimationLoop(frame);
 
-window.APP = { THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit };
+window.APP = { THREE, scene, camera, renderer, controls, tank, MAT, G, T, Kit, PARTS, sun, hemi };
 </script>
 </body>
 </html>
