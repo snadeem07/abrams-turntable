@@ -32,6 +32,7 @@
 <div id="fps">-- fps</div>
 <div id="dock">
   <label><input type="checkbox" id="optSpin" checked> Turntable</label>
+  <label><input type="checkbox" id="optAPS" checked> Active protection</label>
 </div>
 
 <script type="module">
@@ -206,6 +207,7 @@ const MAT = {
   cooler:    std(0xbfb49a, 0.5, 0.0, { name: 'cooler' }),
   waterCan:  std(0x9c8a5f, 0.55, 0.0, { name: 'waterCan' }),
   camNet:    std(0x585b3a, 1.0, 0.0, { name: 'camNet' }),
+  radome:    std(0x3a3d2e, 0.55, 0.0, { name: 'radome' }),
 };
 // wire mesh for the bustle rack: one grid cell per UV unit, alpha-tested
 MAT.mesh = (() => {
@@ -1100,9 +1102,99 @@ tank.add(turret);
 PARTS.turret = turret;
 
 /* =====================================================================
+   aps (active protection units)
+   One unit built for the +X (left) side in turret coordinates, then a
+   mirrored clone (scale.x = -1) for the right side.
+   ===================================================================== */
+function ribbedRadar(k, m, w, h) {
+  k.add(MAT.paint, G.rbox(w + 0.04, h + 0.04, 0.035, 0.01), m);
+  k.add(MAT.radome, G.rbox(w, h, 0.02, 0.006), mul(m, T([0, 0, 0.012])));
+  const n = Math.round(w / 0.034);
+  for (let i = 0; i < n; i++) k.add(MAT.paint, G.box(0.01, h - 0.02, 0.014), mul(m, T([-w / 2 + (i + 0.5) * w / n, 0, 0.024])));
+  k.add(MAT.paint, G.rbox(w + 0.06, 0.03, 0.06, 0.008), mul(m, T([0, h / 2 + 0.03, 0.02])));   // rain lip
+  for (const [x, y] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) k.add(MAT.paint, G.hexBolt(0.008, 0.006), mul(m, T([x * (w / 2 + 0.008), y * (h / 2 + 0.008), 0.018], [Math.PI / 2, 0, 0])));
+}
+function buildAPSUnit() {
+  const grp = new THREE.Group(); grp.name = 'apsUnit';
+  const k = new Kit();
+  const xi = 1.75, xo = 2.05, zR = -0.32, zF = 0.62, zFo = 0.40, y0 = 0.38, y1 = 0.86;
+  // box with slanted front (plan polygon extruded up)
+  const box = G.extrude([[xi, -zR], [xo, -zR], [xo, -zFo], [xi, -zF]].map(([x, nz]) => [x, nz]), y1 - y0 - 0.02, 0.01, 2).rotateX(-Math.PI / 2);
+  k.add(MAT.paint, box, T([0, y0 + 0.01, 0]));
+  // radar face on the slanted front, looking forward and out
+  const fx = (xi + xo) / 2, fz = (zF + zFo) / 2, ny = Math.atan2(zF - zFo, xo - xi);
+  ribbedRadar(k, T([fx + Math.sin(ny) * 0.03, (y0 + y1) / 2, fz + Math.cos(ny) * 0.03], [-0.06, ny, 0, 'YXZ']), 0.3, 0.36);
+  // access panel with latches + hinge on the outer face
+  k.add(MAT.paint, G.rbox(0.014, 0.3, 0.46, 0.006), T([xo + 0.012, 0.6, -0.02]));
+  for (const z of [-0.18, 0.02, 0.18]) {
+    k.add(MAT.darkSteel, G.rbox(0.022, 0.05, 0.035, 0.006), T([xo + 0.026, 0.48, z]));
+    k.add(MAT.steel, G.cylZ(0.005, 0.045, 6), T([xo + 0.036, 0.47, z]));
+  }
+  k.add(MAT.darkSteel, G.cylZ(0.012, 0.44, 10), T([xo + 0.02, 0.755, -0.02]));
+  k.add(MAT.paint, G.rbox(0.36, 0.025, 0.62, 0.008), T([(xi + xo) / 2, y1 + 0.005, -0.02]));    // top plate
+  // standoff brackets with gussets and bolts
+  for (const z of [0.38, 0.06, -0.22]) for (const y of [0.47, 0.78]) {
+    k.add(MAT.paint, G.rbox(0.2, 0.06, 0.07, 0.012), T([1.66, y, z]));
+    k.add(MAT.paint, G.rbox(0.03, 0.12, 0.1, 0.008), T([1.6, y, z]));
+    k.add(MAT.paint, G.hexBolt(0.011, 0.008), T([1.617, y + 0.04, z], [0, 0, -Math.PI / 2]));
+    k.add(MAT.paint, G.hexBolt(0.011, 0.008), T([1.617, y - 0.04, z], [0, 0, -Math.PI / 2]));
+  }
+  for (const z of [0.38, 0.06, -0.22]) k.add(MAT.paint, G.rbox(0.03, 0.34, 0.05, 0.008), T([1.68, 0.625, z], [0, 0, 0.42]));
+  // cables running into the turret wall (with grommets)
+  const cab = [[[xi, 0.8, -0.26], [1.68, 0.83, -0.4], [1.62, 0.78, -0.5], [1.585, 0.72, -0.52]],
+               [[xi, 0.72, -0.28], [1.69, 0.7, -0.42], [1.63, 0.64, -0.5], [1.585, 0.6, -0.5]],
+               [[xi, 0.5, -0.27], [1.7, 0.46, -0.38], [1.63, 0.44, -0.46], [1.59, 0.45, -0.47]]];
+  cab.forEach((pts, i) => {
+    k.add(i === 1 ? MAT.strap : MAT.black, G.tube(pts, i === 0 ? 0.016 : 0.012, 20, 8));
+    const e = pts[pts.length - 1];
+    k.add(MAT.darkSteel, G.cylX(0.026, 0.03, 12), T([e[0] + 0.01, e[1], e[2]]));
+  });
+  // aft radar on a post, looking back and out
+  const px = 1.95, pz = -0.27;
+  k.add(MAT.paint, G.rbox(0.1, 0.04, 0.1, 0.01), T([px, y1 + 0.03, pz]));
+  k.add(MAT.paint, G.cyl(0.028, 0.034, 0.3, 14), T([px, y1 + 0.18, pz]));
+  ribbedRadar(k, T([px + 0.06, y1 + 0.38, pz - 0.06], [-0.05, Math.atan2(0.62, -0.78), 0, 'YXZ']), 0.24, 0.26);
+  // launcher ring on top
+  const lx = (xi + xo) / 2 - 0.01, lz = 0.12;
+  k.add(MAT.paint, G.cyl(0.15, 0.16, 0.05, 28), T([lx, y1 + 0.04, lz]));
+  k.add(MAT.darkSteel, G.cyl(0.12, 0.12, 0.03, 28), T([lx, y1 + 0.08, lz]));
+  grp.add(k.build('apsBody'));
+
+  // turning launcher head with two ports
+  const h = new Kit();
+  h.add(MAT.paint, G.rbox(0.24, 0.17, 0.3, 0.025), T([0, 0.1, 0]));
+  h.add(MAT.paint, G.rbox(0.2, 0.05, 0.22, 0.015), T([0, 0.2, -0.02]));
+  for (const x of [-0.055, 0.055]) {
+    h.add(MAT.paint, G.cylZ(0.048, 0.1, 20), T([x, 0.1, 0.18]));
+    h.add(MAT.darkSteel, G.cylZ(0.052, 0.015, 20), T([x, 0.1, 0.232]));
+    h.add(MAT.black, G.cylZ(0.036, 0.01, 18), T([x, 0.1, 0.236]));
+  }
+  h.add(MAT.darkSteel, G.cylX(0.025, 0.28, 12), T([0, 0.1, -0.05]));
+  const head = h.build('apsLauncher'); head.position.set(lx, y1 + 0.095, lz);
+  grp.add(head);
+  return grp;
+}
+function buildAPS() {
+  const root = new THREE.Group(); root.name = 'aps';
+  const left = buildAPSUnit(), right = left.clone(true);
+  right.scale.x = -1;
+  root.add(left, right);
+  const heads = [left, right].map(u => u.getObjectByName('apsLauncher'));
+  onFrame((dt, t) => {
+    if (!root.visible) return;
+    heads.forEach((hd, i) => { hd.rotation.y = 0.35 + 0.55 * Math.sin(t * 0.35 + i * 1.7) + 0.15 * Math.sin(t * 0.9 + i); });
+  });
+  return root;
+}
+const aps = buildAPS();
+PARTS.turret.add(aps);
+PARTS.aps = aps;
+
+/* =====================================================================
    ui (minimal for now)
    ===================================================================== */
 document.getElementById('optSpin').addEventListener('change', e => { controls.autoRotate = e.target.checked; });
+document.getElementById('optAPS').addEventListener('change', e => { PARTS.aps.visible = e.target.checked; });
 
 /* =====================================================================
    perf: FPS readout, resize
